@@ -44,6 +44,20 @@ def test_equal_priorities_match_stock_frontier(env, seed):
     assert sum(r.get_total_preemption_count() for r in stock._all_requests) > 0
 
 
+def test_seeds_give_different_workloads():
+    spec = WorkloadSpec(
+        name="seeded", num_requests=30, qps=10,
+        length_trace="data/processed_traces/splitwise_conv.csv", dummy_exec_ms=0.05,
+    )
+    env = FrontierSchedulingEnv(spec)
+    a = env.run_episode(baseline_agent("fcfs"), 0).requests
+    b = env.run_episode(baseline_agent("fcfs"), 1).requests
+    a2 = env.run_episode(baseline_agent("fcfs"), 0).requests
+    lengths = lambda rs: [(r.arrived_at, r.num_prefill_tokens, r.num_decode_tokens) for r in rs]
+    assert lengths(a) == lengths(a2)
+    assert lengths(a) != lengths(b)
+
+
 def test_ranking_changes_the_schedule(env):
     fcfs = env.run_episode(baseline_agent("fcfs"), 0).summary
     sjf = env.run_episode(baseline_agent("sjf_prefill"), 0).summary

@@ -72,6 +72,12 @@ class WorkloadSpec:
     enable_prefix_caching: bool = False
     # fixed time per batch instead of the profiled predictor (plumbing tests)
     dummy_exec_ms: Optional[float] = None
+    # Frontier's per-step CPU overhead model (off by default in Frontier)
+    model_cpu_overhead: bool = True
+    # Round every predictor input to this many significant bits (5 = within
+    # ~3%), so that prediction memo hits across episodes; None = exact.
+    # Approximate, like Vidur's 64-token KV granularity; see rl/README.
+    prediction_rounding_bits: Optional[int] = None
     # any other frontier.main flags, e.g. ["--enable_thinking_mode", ...]
     extra_args: List[str] = field(default_factory=list)
 
@@ -97,12 +103,16 @@ def simulation_args(
         "--decode_cuda_graph_mode", "none",
         "--random_forrest_execution_time_predictor_config_prediction_max_prefill_chunk_size",
         str(max(spec.max_tokens_in_batch, 1024)),
-        "--no-random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling",
         "--metrics_config_output_dir", output_dir,
         "--no-metrics_config_write_metrics",
         "--no-metrics_config_store_plots",
         "--no-metrics_config_enable_chrome_trace",
         "--no-metrics_config_write_json_trace",
+    ]
+    args += [
+        "--no-random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling"
+        if spec.model_cpu_overhead
+        else "--random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling"
     ]
     if spec.dummy_exec_ms is not None:
         args += [
@@ -127,34 +137,41 @@ def simulation_args(
             "--trace_request_generator_config_trace_file", spec.replay_trace,
             "--trace_request_generator_config_time_scale_factor", str(spec.replay_time_scale),
             "--trace_request_generator_config_max_tokens", str(spec.max_tokens),
+            "--trace_request_generator_config_seed", str(seed),
         ]
     else:
         args += [
             "--request_generator_config_type", "synthetic",
             "--synthetic_request_generator_config_num_requests", str(spec.num_requests),
+            # each generator has its own seed (default 42); --seed reaches none of them
+            "--synthetic_request_generator_config_seed", str(seed),
         ]
         if spec.length_trace:
             args += [
                 "--length_generator_config_type", "trace",
                 "--trace_request_length_generator_config_trace_file", spec.length_trace,
                 "--trace_request_length_generator_config_max_tokens", str(spec.max_tokens),
+                "--trace_request_length_generator_config_seed", str(seed),
             ]
         else:
             args += [
                 "--length_generator_config_type", "fixed",
                 "--fixed_request_length_generator_config_prefill_tokens", str(spec.prefill_tokens),
                 "--fixed_request_length_generator_config_decode_tokens", str(spec.decode_tokens),
+                "--fixed_request_length_generator_config_seed", str(seed),
             ]
         if spec.arrivals == "poisson":
             args += [
                 "--interval_generator_config_type", "poisson",
                 "--poisson_request_interval_generator_config_qps", str(spec.qps),
+                "--poisson_request_interval_generator_config_seed", str(seed),
             ]
         elif spec.arrivals == "gamma":
             args += [
                 "--interval_generator_config_type", "gamma",
                 "--gamma_request_interval_generator_config_qps", str(spec.qps),
                 "--gamma_request_interval_generator_config_cv", str(spec.cv),
+                "--gamma_request_interval_generator_config_seed", str(seed),
             ]
         else:
             raise ValueError(f"unknown arrivals {spec.arrivals}")
@@ -186,7 +203,79 @@ def _working_dir(path: str) -> Iterator[None]:
         os.chdir(previous)
 
 
-FRONTIER_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Building a predictor re-derives its lookup tables from the cached sklearn
+# models: about 50 s for the H200 Llama-2-7B profile, against seconds for the
+# event loop. It depends only on the hardware and engine settings, so it is
+# built once per process for each and handed to every later Simulator, which
+# also keeps its memo of past predictions warm.
+_PREDICTORS: Dict[Tuple, Dict[Any, Any]] = {}
+_WORKLOAD_FIELDS = {
+    "name", "num_requests", "qps", "arrivals", "cv", "length_trace",
+    "prefill_tokens", "decode_tokens", "replay_trace", "replay_time_scale",
+}
+
+
+def _engine_key(spec: WorkloadSpec) -> Tuple:
+    return tuple(
+        (k, tuple(v) if isinstance(v, list) else v)
+        for k, v in sorted(vars(spec).items())
+        if k not in _WORKLOAD_FIELDS
+    )
+
+
+def _round_bits(value: Any, bits: int) -> Any:
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.floating, np.integer)):
+        return value
+    value = float(value)
+    if value == 0.0 or not np.isfinite(value):
+        return value
+    mantissa, exponent = np.frexp(value)
+    return float(np.ldexp(np.round(mantissa * (1 << bits)) / (1 << bits), exponent))
+
+
+def _round_predictor_inputs(predictor: Any, bits: int) -> None:
+    """Round the features of every model lookup, so the memo is reused."""
+    for name in ("_get_prediction_for_features", "_get_on_demand_prediction"):
+        method = getattr(predictor, name, None)
+        if method is None:
+            continue
+
+        def rounded(model_name, features, *args, _method=method, **kwargs):
+            features = {k: _round_bits(v, bits) for k, v in features.items()}
+            return _method(model_name, features, *args, **kwargs)
+
+        setattr(predictor, name, rounded)
+
+
+@contextmanager
+def _shared_predictors(key: Tuple) -> Iterator[None]:
+    from frontier.execution_time_predictor.execution_time_predictor_registry import (
+        ExecutionTimePredictorRegistry,
+    )
+
+    cache = _PREDICTORS.setdefault(key, {})
+    original = ExecutionTimePredictorRegistry.__dict__["get"]
+
+    def get(cls, *args, **kwargs):
+        cluster_type = kwargs.get("cluster_type")
+        if cluster_type not in cache:
+            cache[cluster_type] = original.__func__(cls, *args, **kwargs)
+            bits = dict(key).get("prediction_rounding_bits")
+            if bits is not None:
+                _round_predictor_inputs(cache[cluster_type], bits)
+        predictor = cache[cluster_type]
+        # the only per-Simulator object it holds
+        predictor._cc_backend = kwargs.get("cc_backend", predictor._cc_backend)
+        return predictor
+
+    ExecutionTimePredictorRegistry.get = classmethod(get)
+    try:
+        yield
+    finally:
+        ExecutionTimePredictorRegistry.get = original
+
+
+FRONTIER_ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # ---------------------------------------------------------------------------
@@ -363,13 +452,17 @@ class FrontierSchedulingEnv:
             simulator.run()
         return simulator
 
-    def make_simulator(self, seed: int):
+    def make_simulator(self, seed: int, reuse_predictor: bool = True):
         from frontier.utils.random import set_seeds
 
         config = make_simulation_config(self.spec, seed, self._output_dir, self._log_level)
         set_seeds(seed)
         with rl_scheduler_installed():
-            simulator = _RLSimulator(config)
+            if reuse_predictor:
+                with _shared_predictors(_engine_key(self.spec)):
+                    simulator = _RLSimulator(config)
+            else:
+                simulator = _RLSimulator(config)
         return simulator
 
     def run_episode(self, agent: BaseAgent, seed: int = 0) -> Episode:
