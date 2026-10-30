@@ -257,3 +257,6 @@ worktreess/
 
 # Per-host bindings of the agent skills under skills/ (skills/README.md).
 skills/*/site.local.md
+
+# RL run outputs (frontier/rl)
+rl_runs/

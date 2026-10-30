@@ -20,11 +20,27 @@ import pandas as pd
 
 from frontier.rl.env import WorkloadSpec
 
-AZURE = "data/processed_traces/splitwise_conv.csv"
-WORKLOADS = {
-    "azure_q10_b4000": dict(qps=10, num_blocks=4000, length_trace=AZURE),
-    "azure_q6": dict(qps=6, length_trace=AZURE),
+TRACES = {
+    # name: (length trace, FCFS capacity in qps on H200 + Llama-2-7B, from
+    # rl_runs/capacity.txt: batch-cap bound for conv/sharegpt, prefill bound for code)
+    "conv": ("data/processed_traces/splitwise_conv.csv", 27.0),
+    "code": ("data/processed_traces/splitwise_code.csv", 22.0),
+    "sharegpt": ("data/processed_traces/sharegpt_llama3_tokenizer.csv", 27.0),
 }
+
+
+def _grid():
+    out = {}
+    for trace, (path, capacity) in TRACES.items():
+        base = dict(length_trace=path, prediction_rounding_bits=5)
+        for load in (0.7, 0.9, 1.1):
+            out[f"{trace}_load{int(load * 100)}"] = dict(base, qps=round(capacity * load, 1))
+        out[f"{trace}_load90_mem4000"] = dict(base, qps=round(capacity * 0.9, 1), num_blocks=4000)
+        out[f"{trace}_load90_bursty"] = dict(base, qps=round(capacity * 0.9, 1), arrivals="gamma", cv=3.0)
+    return out
+
+
+WORKLOADS = _grid()
 AGING = (0, 200, 400, 800, 1600)
 DEFAULT_POLICIES = (
     ["fcfs"]
@@ -76,8 +92,8 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--policies", nargs="*", default=list(DEFAULT_POLICIES))
     parser.add_argument("--workloads", nargs="*", default=list(WORKLOADS))
-    parser.add_argument("--seeds", type=int, nargs="*", default=list(range(2000000, 2000010)))
-    parser.add_argument("--num-requests", type=int, default=300)
+    parser.add_argument("--seeds", type=int, nargs="*", default=list(range(2000000, 2000006)))
+    parser.add_argument("--num-requests", type=int, default=1000)
     parser.add_argument("--num-workers", type=int, default=max(1, os.cpu_count() - 2))
     args = parser.parse_args()
 
