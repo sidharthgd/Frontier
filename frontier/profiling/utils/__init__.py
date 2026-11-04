@@ -426,11 +426,29 @@ def get_attention_input_combinations(
         product([0], kv_cache_sizes_to_profile, batch_sizes_to_profile, [False])
     )
 
+    # Optional cap on prefill chunk size (FRONTIER_MAX_PREFILL_CHUNK). A vLLM
+    # step never prefills more than max_num_batched_tokens tokens, so larger
+    # chunks are never priced at runtime, and at long contexts they dominate
+    # profiling time.
+    max_prefill_chunk_raw = os.environ.get("FRONTIER_MAX_PREFILL_CHUNK", "").strip()
+    max_prefill_chunk = int(max_prefill_chunk_raw) if max_prefill_chunk_raw else None
+    if max_prefill_chunk is not None and max_prefill_chunk <= 0:
+        raise ValueError(
+            f"FRONTIER_MAX_PREFILL_CHUNK must be positive, got {max_prefill_chunk}"
+        )
+
     valid_input_combinations = []
     # The first chunk of chunk size L and the full prefill of length L are the
     # same input; profile it once.
     for input_combination in dict.fromkeys(input_combinations):
         prefill_chunk_size, kv_cache_size, batch_size, is_prefill = input_combination
+
+        if (
+            is_prefill
+            and max_prefill_chunk is not None
+            and prefill_chunk_size > max_prefill_chunk
+        ):
+            continue
 
         if is_prefill and profile_only_decode:
             continue
