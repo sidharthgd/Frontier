@@ -17,6 +17,9 @@ Baseline agents, by name (as in vidur/rl/agents.py):
                                 blocks) is sized g * its cached tokens smaller
     sjf_uncached_deadline<d>    sjf_uncached, but calls waiting longer than d seconds
                                 go first (oldest first)
+    sjf_uncached_hrrn<t>        uncached tokens / (1 + wait / t): a call's size shrinks in
+                                proportion to how long it has waited (highest response
+                                ratio next, as in HRRN scheduling)
 """
 
 import re
@@ -126,9 +129,17 @@ def _deadline_size(seconds: float):
     return size
 
 
+def _hrrn_size(scale_s: float):
+    def size(obs: Observation) -> np.ndarray:
+        return _uncached(obs) / (1.0 + obs.waiting_feature("wait_time") / scale_s)
+
+    return size
+
+
 _SJF = re.compile(r"^sjf_(?P<key>prefill|total)(?:_age(?P<age>[0-9.]+))?$")
 _RULE = re.compile(r"^(?P<rule>sjf_uncached|session_fewest|oracle_cost)(?:_age(?P<age>[0-9.]+))?$")
 _EVICT = re.compile(r"^sjf_uncached_evict(?P<g>[0-9.]+)_(?P<k>[0-9]+)$")
+_HRRN = re.compile(r"^sjf_uncached_hrrn(?P<t>[0-9.]+)$")
 _DEADLINE = re.compile(r"^sjf_uncached_deadline(?P<d>[0-9.]+)$")
 
 
@@ -155,4 +166,7 @@ def baseline_agent(name: str, seed: Optional[int] = None) -> BaseAgent:
     match = _DEADLINE.match(name)
     if match:
         return SizeAgent(_deadline_size(float(match["d"])))
+    match = _HRRN.match(name)
+    if match:
+        return SizeAgent(_hrrn_size(float(match["t"])))
     raise ValueError(f"unknown baseline {name}. {__doc__}")

@@ -32,14 +32,15 @@ METRICS = (
 
 
 def run_task(args):
-    num_sessions, seed, policies, calls_per_session = args
-    from frontier.rl.agent_trace import SessionWorkload
+    num_sessions, seed, policies, calls_per_session, shared_prefix = args
+    from frontier.rl.agent_trace import DEFAULT_SHARED_PREFIX, SessionWorkload
     from frontier.rl.agents import baseline_agent
     from frontier.rl.env import FrontierSchedulingEnv, a100_llama31_8b
 
     workload = SessionWorkload(
         CALLS, num_sessions=num_sessions, calls_per_session=calls_per_session,
         session_rate=num_sessions / 60.0,
+        shared_prefix_tokens=DEFAULT_SHARED_PREFIX if shared_prefix else (),
     )
     env = FrontierSchedulingEnv(a100_llama31_8b(
         name=f"agents_{num_sessions}", sessions=workload,
@@ -87,10 +88,12 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, nargs="*", default=[0, 1, 2, 3])
     parser.add_argument("--calls-per-session", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--shared-prefix", action="store_true",
+                        help="contexts of a provider share its system-prompt hash chain")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    tasks = [(n, s, args.policies, args.calls_per_session) for n in args.loads for s in args.seeds]
+    tasks = [(n, s, args.policies, args.calls_per_session, args.shared_prefix) for n in args.loads for s in args.seeds]
     with mp.get_context("spawn").Pool(args.num_workers) as pool:
         rows = [r for task_rows in pool.imap_unordered(run_task, tasks) for r in task_rows]
     order = {f"sessions{n}": i for i, n in enumerate(args.loads)}
