@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 WAITING_FEATURES: Tuple[str, ...] = (
     "prompt_tokens",          # prompt of the current round (grows after a restart)
     "processed_tokens",       # already computed (chunked prefill progress)
-    "cached_prompt_tokens",   # prefix-cache hit counted so far
+    "cached_prompt_tokens",   # prompt tokens in the prefix cache right now
     "wait_time",              # seconds since arrival
     "num_preemptions",        # times evicted so far
     "blocks_needed",          # KV blocks for the whole prompt
@@ -27,6 +27,7 @@ WAITING_FEATURES: Tuple[str, ...] = (
     "round_index",            # thinking / agent round, 0 for single-round requests
     "num_rounds",
     "current_priority",
+    "evict_distance_blocks",  # blocks allocated before its cached prefix loses a block; -1 none/held
 )
 RUNNING_FEATURES: Tuple[str, ...] = (
     "prompt_tokens",
@@ -38,6 +39,8 @@ RUNNING_FEATURES: Tuple[str, ...] = (
 )
 GLOBAL_FEATURES: Tuple[str, ...] = (
     "free_block_fraction",
+    "num_free_blocks",
+    "block_size",
     "num_waiting",
     "num_running",
     "max_tokens_in_batch",
@@ -69,6 +72,11 @@ class Observation:
 
 
 def _round(request: Request) -> Tuple[int, int]:
+    # agent sessions (frontier/rl/agent_trace.py): the call's index in its
+    # session; the session's length is unknown to a server
+    call_index = getattr(request, "_rl_call_index", None)
+    if call_index is not None:
+        return call_index, 0
     if request.is_thinking_mode_enabled:
         return request.current_thinking_round_index, request.thinking_depth
     return 0, 1
@@ -86,11 +94,12 @@ def build_observation(
     for r in waiting:
         blocks = ceil(r.num_prefill_tokens / block_size)
         round_index, num_rounds = _round(r)
+        cached_tokens, evict_distance = scheduler.cache_state(r)
         rows.append(
             (
                 r.num_prefill_tokens,
                 r.num_processed_tokens,
-                r.num_prefill_tokens_cached,
+                max(r.num_prefill_tokens_cached, cached_tokens),
                 time - r.arrived_at,
                 r.get_total_preemption_count(),
                 blocks,
@@ -98,6 +107,7 @@ def build_observation(
                 round_index,
                 num_rounds,
                 r.priority,
+                evict_distance,
             )
         )
     running_rows = [
@@ -113,6 +123,8 @@ def build_observation(
     ]
     global_features = (
         scheduler.num_free_blocks / max(1, scheduler.num_blocks),
+        scheduler.num_free_blocks,
+        block_size,
         len(waiting),
         len(running_rows),
         scheduler.max_tokens_in_batch,

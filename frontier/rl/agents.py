@@ -6,6 +6,17 @@ Baseline agents, by name (as in vidur/rl/agents.py):
     sjf_prefill[_age<r>]        shortest prompt first; aging subtracts r tokens per
                                 second waited. Needs no oracle.
     sjf_total[_age<r>]          oracle: prompt + true output length
+    sjf_uncached[_age<r>]       shortest uncached prompt first: the prompt tokens
+                                not in the prefix cache now, i.e. the prefill a
+                                call actually costs. Needs no oracle.
+    session_fewest[_age<r>]     fewest earlier calls in its session first, an
+                                attained-service rule like Autellix's
+    oracle_cost[_age<r>]        oracle: uncached prompt + true output length
+    sjf_uncached_evict<g>_<k>   sjf_uncached, but a call whose cached prefix will lose
+                                a block within k allocations (eviction distance < k
+                                blocks) is sized g * its cached tokens smaller
+    sjf_uncached_deadline<d>    sjf_uncached, but calls waiting longer than d seconds
+                                go first (oldest first)
 """
 
 import re
@@ -66,7 +77,59 @@ class OracleSJFAgent(OracleAgent):
         return _ranks(sizes, obs), {}
 
 
+class SizeAgent(BaseAgent):
+    """Ranks by a size computed from the observation, minus aging * wait."""
+
+    unbounded_priorities = True
+
+    def __init__(self, size_fn, aging: float = 0.0) -> None:
+        self._size_fn = size_fn
+        self._aging = aging
+
+    def act(self, obs: Observation):
+        sizes = self._size_fn(obs) - self._aging * obs.waiting_feature("wait_time")
+        return _ranks(sizes, obs), {}
+
+
+def _uncached(obs: Observation) -> np.ndarray:
+    return np.maximum(
+        obs.waiting_feature("prompt_tokens") - obs.waiting_feature("cached_prompt_tokens"), 0
+    )
+
+
+class OracleCostAgent(OracleAgent):
+    unbounded_priorities = True
+
+    def __init__(self, aging: float = 0.0) -> None:
+        self._aging = aging
+
+    def act_oracle(self, obs, waiting, scheduler):
+        sizes = _uncached(obs) + np.array([r.num_decode_tokens for r in waiting], dtype=float)
+        sizes -= self._aging * obs.waiting_feature("wait_time")
+        return _ranks(sizes, obs), {}
+
+
+def _evict_size(gamma: float, within_blocks: int):
+    def size(obs: Observation) -> np.ndarray:
+        distance = obs.waiting_feature("evict_distance_blocks")
+        at_risk = (distance >= 0) & (distance < within_blocks)
+        return _uncached(obs) - gamma * obs.waiting_feature("cached_prompt_tokens") * at_risk
+
+    return size
+
+
+def _deadline_size(seconds: float):
+    def size(obs: Observation) -> np.ndarray:
+        overdue = obs.waiting_feature("wait_time") > seconds
+        return np.where(overdue, -1e12, _uncached(obs))
+
+    return size
+
+
 _SJF = re.compile(r"^sjf_(?P<key>prefill|total)(?:_age(?P<age>[0-9.]+))?$")
+_RULE = re.compile(r"^(?P<rule>sjf_uncached|session_fewest|oracle_cost)(?:_age(?P<age>[0-9.]+))?$")
+_EVICT = re.compile(r"^sjf_uncached_evict(?P<g>[0-9.]+)_(?P<k>[0-9]+)$")
+_DEADLINE = re.compile(r"^sjf_uncached_deadline(?P<d>[0-9.]+)$")
 
 
 def baseline_agent(name: str, seed: Optional[int] = None) -> BaseAgent:
@@ -78,4 +141,18 @@ def baseline_agent(name: str, seed: Optional[int] = None) -> BaseAgent:
     if match:
         aging = float(match["age"] or 0.0)
         return PromptSJFAgent(aging) if match["key"] == "prefill" else OracleSJFAgent(aging)
+    match = _RULE.match(name)
+    if match:
+        aging = float(match["age"] or 0.0)
+        if match["rule"] == "sjf_uncached":
+            return SizeAgent(_uncached, aging)
+        if match["rule"] == "session_fewest":
+            return SizeAgent(lambda obs: obs.waiting_feature("round_index"), aging)
+        return OracleCostAgent(aging)
+    match = _EVICT.match(name)
+    if match:
+        return SizeAgent(_evict_size(float(match["g"]), int(match["k"])))
+    match = _DEADLINE.match(name)
+    if match:
+        return SizeAgent(_deadline_size(float(match["d"])))
     raise ValueError(f"unknown baseline {name}. {__doc__}")

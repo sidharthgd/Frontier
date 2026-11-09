@@ -78,8 +78,34 @@ class WorkloadSpec:
     # ~3%), so that prediction memo hits across episodes; None = exact.
     # Approximate, like Vidur's 64-token KV granularity; see rl/README.
     prediction_rounding_bits: Optional[int] = None
+    # decode CUDA graphs as vLLM runs them: none | piecewise | full_decode_only
+    decode_cuda_graph_mode: str = "none"
+    # context limit (vLLM --max-model-len) and the predictor's lookup range
+    max_model_len: Optional[int] = None
+    prediction_max_tokens_per_request: Optional[int] = None
+    prediction_max_batch_size: Optional[int] = None
+    # agent sessions (frontier/rl/agent_trace.py); replaces the request generator
+    sessions: Optional["SessionWorkload"] = None
     # any other frontier.main flags, e.g. ["--enable_thinking_mode", ...]
     extra_args: List[str] = field(default_factory=list)
+
+
+def a100_llama31_8b(**overrides) -> "WorkloadSpec":
+    """
+    A100 80GB PCIe + Llama-3.1-8B as validated against vLLM 0.10.2
+    (data/profiling/compute/a100/llama3.1-8b/README.md): FlashInfer, 2048-token
+    steps, 256 sequences, 128k context, 453,088-token KV cache, piecewise CUDA
+    graphs, no CPU-overhead tables.
+    """
+    spec = dict(
+        model="llama3.1-8b", device="a100", network_device="a100_dgx",
+        max_tokens_in_batch=2048, batch_size_cap=256, num_blocks=28318,
+        decode_cuda_graph_mode="piecewise", model_cpu_overhead=False,
+        max_model_len=131072, prediction_max_tokens_per_request=131072,
+        prediction_max_batch_size=256, max_tokens=131072,
+    )
+    spec.update(overrides)
+    return WorkloadSpec(**spec)
 
 
 def simulation_args(
@@ -100,7 +126,7 @@ def simulation_args(
         "--vllm_v1_scheduler_config_enable_chunked_prefill",
         "--vllm_v1_scheduler_config_max_tokens_in_batch", str(spec.max_tokens_in_batch),
         "--vllm_v1_scheduler_config_batch_size_cap", str(spec.batch_size_cap),
-        "--decode_cuda_graph_mode", "none",
+        "--decode_cuda_graph_mode", spec.decode_cuda_graph_mode,
         "--random_forrest_execution_time_predictor_config_prediction_max_prefill_chunk_size",
         str(max(spec.max_tokens_in_batch, 1024)),
         "--metrics_config_output_dir", output_dir,
@@ -114,6 +140,18 @@ def simulation_args(
         if spec.model_cpu_overhead
         else "--random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling"
     ]
+    if spec.max_model_len is not None:
+        args += ["--vllm_v1_scheduler_config_max_model_len", str(spec.max_model_len)]
+    if spec.prediction_max_tokens_per_request is not None:
+        args += [
+            "--random_forrest_execution_time_predictor_config_prediction_max_tokens_per_request",
+            str(spec.prediction_max_tokens_per_request),
+        ]
+    if spec.prediction_max_batch_size is not None:
+        args += [
+            "--random_forrest_execution_time_predictor_config_prediction_max_batch_size",
+            str(spec.prediction_max_batch_size),
+        ]
     if spec.dummy_exec_ms is not None:
         args += [
             "--random_forrest_execution_time_predictor_config_enable_dummy_mode",
@@ -130,7 +168,22 @@ def simulation_args(
     if spec.enable_prefix_caching:
         args += ["--vllm_v1_scheduler_config_enable_prefix_caching"]
 
-    if spec.arrivals == "replay":
+    if spec.sessions is not None:
+        # the env builds the session requests itself (_RLSimulator); Frontier
+        # only checks that prefix caching has a trace source with session ids
+        # and block hashes, so it gets a one-row placeholder
+        placeholder = os.path.join(output_dir, "session_placeholder.csv")
+        if not os.path.exists(placeholder):
+            os.makedirs(output_dir, exist_ok=True)
+            with open(placeholder, "w") as f:
+                f.write('arrived_at,num_prefill_tokens,num_decode_tokens,session_id,block_hash_ids\n'
+                        '0.0,16,1,0,"[0]"\n')
+        args += [
+            "--request_generator_config_type", "trace_replay",
+            "--trace_request_generator_config_trace_file", placeholder,
+            "--trace_request_generator_config_max_tokens", str(spec.max_tokens),
+        ]
+    elif spec.arrivals == "replay":
         assert spec.replay_trace, "arrivals=replay needs replay_trace"
         args += [
             "--request_generator_config_type", "trace_replay",
@@ -212,6 +265,7 @@ _PREDICTORS: Dict[Tuple, Dict[Any, Any]] = {}
 _WORKLOAD_FIELDS = {
     "name", "num_requests", "qps", "arrivals", "cv", "length_trace",
     "prefill_tokens", "decode_tokens", "replay_trace", "replay_time_scale",
+    "sessions",
 }
 
 
@@ -400,6 +454,9 @@ class AgentPriorityPolicy(PriorityPolicy):
             return
         transition, waiting, previous = self._pending
         self._pending = None
+        # agents that keep their own history (e.g. vidur_transfer.VidurCheckpointAgent)
+        if hasattr(self._agent, "on_admission"):
+            self._agent.on_admission(waiting, transition.priorities, admitted)
         if not admitted:
             # no effect on admission: undo, so it has no effect on preemption
             for request, priority in zip(waiting, previous):
@@ -411,6 +468,8 @@ class AgentPriorityPolicy(PriorityPolicy):
         self.transitions.append(transition)
 
     def on_batch_end(self, batch: Batch) -> None:
+        if hasattr(self._agent, "on_batch_end"):
+            self._agent.on_batch_end(batch)
         time = float(batch.completed_at)
         for request in batch.requests:
             record = self._record(request)
@@ -448,9 +507,15 @@ class FrontierSchedulingEnv:
         with _working_dir(FRONTIER_ROOT):
             config = make_simulation_config(self.spec, seed, self._output_dir, self._log_level)
             set_seeds(seed)
-            simulator = _RLSimulator(config)
+            # the RL scheduler without a policy is stock Frontier (tested);
+            # it carries the hook that releases a session's next call
+            with rl_scheduler_installed():
+                simulator = _RLSimulator(config, self._sessions(seed))
             simulator.run()
         return simulator
+
+    def _sessions(self, seed: int):
+        return self.spec.sessions.build(seed) if self.spec.sessions is not None else None
 
     def make_simulator(self, seed: int, reuse_predictor: bool = True):
         from frontier.utils.random import set_seeds
@@ -460,9 +525,9 @@ class FrontierSchedulingEnv:
         with rl_scheduler_installed():
             if reuse_predictor:
                 with _shared_predictors(_engine_key(self.spec)):
-                    simulator = _RLSimulator(config)
+                    simulator = _RLSimulator(config, self._sessions(seed))
             else:
-                simulator = _RLSimulator(config)
+                simulator = _RLSimulator(config, self._sessions(seed))
         return simulator
 
     def run_episode(self, agent: BaseAgent, seed: int = 0) -> Episode:
@@ -495,7 +560,47 @@ class FrontierSchedulingEnv:
 
 
 class _RLSimulator(Simulator):
-    """Frontier's simulator without the end-of-run metric dump."""
+    """
+    Frontier's simulator without the end-of-run metric dump. With a session
+    plan (SessionWorkload.build) it replaces the request generator: only each
+    session's first call is scheduled up front, and every later call arrives
+    when its predecessor finishes plus the tool gap (closed loop).
+    """
+
+    def __init__(self, config, sessions=None) -> None:
+        self._session_plan = sessions
+        self._next_call: Dict[int, Tuple[Request, float]] = {}
+        super().__init__(config)
+        if sessions is not None:
+            for scheduler in replica_schedulers(self):
+                scheduler.completion_listeners.append(self._release_next_call)
+
+    def _init_event_queue(self) -> None:
+        if self._session_plan is None:
+            return super()._init_event_queue()
+        from frontier.events.request_arrival_event import RequestArrivalEvent
+        from frontier.types import ClusterType
+
+        first_calls, self._next_call, requests = self._session_plan
+        self._all_requests = list(requests)
+        self._requests_by_session_id = {}
+        self._metric_store.register_total_requests(len(requests))
+        for request in first_calls:
+            self._add_event(
+                RequestArrivalEvent(request.arrived_at, request, ClusterType.MONOLITHIC)
+            )
+
+    def _release_next_call(self, request: Request) -> None:
+        from frontier.events.request_arrival_event import RequestArrivalEvent
+        from frontier.types import ClusterType
+
+        item = self._next_call.pop(request.id, None)
+        if item is None:
+            return
+        next_request, gap = item
+        time = max(float(self._time), float(request.completed_at)) + gap
+        next_request.set_arrived_at(time)
+        self._add_event(RequestArrivalEvent(time, next_request, ClusterType.MONOLITHIC))
 
     def _write_output(self) -> None:
         pass
@@ -532,4 +637,25 @@ def summarize(episode: Episode) -> Dict[str, float]:
         for q in (0.5, 0.95, 0.99):
             out[f"p{int(q * 100)}_{name}"] = _quantile(values, q)
         out[f"max_{name}"] = float(values.max()) if len(values) else float("nan")
+    sessions: Dict[int, List[RequestRecord]] = {}
+    for r in done:
+        if r.session_id is not None:
+            sessions.setdefault(r.session_id, []).append(r)
+    if sessions:
+        # time from a session's first arrival to its last completion (its
+        # tool gaps are fixed by the trace, so differences are scheduling)
+        jct = np.array([
+            max(r.completed_at for r in rs) - min(r.arrived_at for r in rs)
+            for rs in sessions.values()
+        ])
+        out["num_sessions"] = len(sessions)
+        out["mean_session_jct"] = float(jct.mean())
+        out["p50_session_jct"] = _quantile(jct, 0.5)
+        out["p99_session_jct"] = _quantile(jct, 0.99)
+        out["max_session_jct"] = float(jct.max())
+        # time each session spends waiting on the server: the sum of its
+        # calls' e2e times (its jct without the tool gaps)
+        serving = np.array([sum(r.completed_at - r.arrived_at for r in rs) for rs in sessions.values()])
+        out["mean_session_serving"] = float(serving.mean())
+        out["p99_session_serving"] = _quantile(serving, 0.99)
     return out

@@ -30,6 +30,52 @@ from frontier.scheduler.replica_scheduler.vllm_v1_engine_replica_scheduler impor
 from frontier.types import ReplicaSchedulerType
 
 
+class _FreeOrder:
+    """Sequence numbers of the blocks in the free queue, with a Fenwick tree of which are still queued."""
+
+    def __init__(self) -> None:
+        self._size = 1 << 16
+        self._tree = [0] * (self._size + 1)
+        self._queued = bytearray(self._size)
+        self._next = 0
+
+    def _grow(self) -> None:
+        self._size *= 2
+        self._queued.extend(bytearray(self._size - len(self._queued)))
+        self._tree = [0] * (self._size + 1)
+        for i in range(self._size):
+            if self._queued[i]:
+                self._update(i, 1)
+
+    def _update(self, seq: int, delta: int) -> None:
+        i = seq + 1
+        while i <= self._size:
+            self._tree[i] += delta
+            i += i & -i
+
+    def add(self, block) -> None:
+        if self._next >= self._size:
+            self._grow()
+        block._free_seq = self._next
+        self._queued[self._next] = 1
+        self._update(self._next, 1)
+        self._next += 1
+
+    def discard(self, block) -> None:
+        seq = getattr(block, "_free_seq", None)
+        if seq is not None and self._queued[seq]:
+            self._queued[seq] = 0
+            self._update(seq, -1)
+
+    def ahead(self, seq: int) -> int:
+        """Blocks queued with a smaller sequence number: those evicted before this one."""
+        total, i = 0, seq
+        while i > 0:
+            total += self._tree[i]
+            i -= i & -i
+        return total
+
+
 class PriorityPolicy:
     """
     What the scheduler calls. get_priorities returns one priority per request
@@ -59,6 +105,8 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
         super().__init__(*args, **kwargs)
         self._priority_policy: Optional[PriorityPolicy] = None
         self._ranked_waiting: List[Request] = []
+        # called with each request that finishes, after the batch ends
+        self.completion_listeners: List[Callable[[Request], None]] = []
 
     def set_priority_policy(self, policy: Optional[PriorityPolicy]) -> None:
         if policy is not None:
@@ -98,6 +146,63 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
     def prefix_caching_enabled(self) -> bool:
         return bool(self._is_prefix_caching_enabled())
 
+    def _install_free_order(self) -> None:
+        """
+        Track the free queue's order exactly. Each block gets a sequence number
+        when it enters the queue (the queue is FIFO, so the order is the
+        sequence), and a Fenwick tree counts the sequence numbers still queued.
+        The number of blocks ahead of a block, i.e. how many allocations until
+        it is evicted, is then one prefix sum.
+        """
+        queue = self._kv_cache_manager.block_pool.free_block_queue
+        if getattr(queue, "_rl_order", None) is not None:
+            return
+        order = _FreeOrder()
+        block = queue.free_list_head
+        while block is not None:
+            order.add(block)
+            block = block.next_free_block
+        append, remove = queue.append, queue.remove
+
+        def tracked_append(block):
+            append(block)
+            order.add(block)
+
+        def tracked_remove(block):
+            order.discard(block)
+            remove(block)
+
+        queue.append, queue.remove = tracked_append, tracked_remove
+        queue._rl_order = order
+
+    def cache_state(self, request: Request) -> Tuple[int, int]:
+        """
+        (cached prompt tokens, eviction distance) of `request`, read without
+        touching hit statistics or eviction order. Cached tokens are the
+        leading prompt blocks present in the prefix cache now. The distance is
+        how many blocks will be allocated before the first of those blocks
+        that no running request holds is evicted (-1: none, or all held).
+        Both are 0 / -1 with prefix caching off.
+        """
+        if not self.prefix_caching_enabled or request.block_hash_ids is None:
+            return 0, -1
+        self._install_free_order()
+        pool = self._kv_cache_manager.block_pool
+        hits, first_out = 0, None
+        for block_hash in request.prompt_block_hash_ids(self.block_size):
+            cached = pool.cached_block_hash_to_block.get(block_hash)
+            if not cached:
+                break
+            hits += 1
+            block = next(iter(cached.values()))
+            if block.ref_cnt == 0 and (first_out is None or block._free_seq < first_out):
+                first_out = block._free_seq
+        distance = -1 if first_out is None else pool.free_block_queue._rl_order.ahead(first_out)
+        return hits * self.block_size, distance
+
+    def cached_prompt_tokens(self, request: Request) -> int:
+        return self.cache_state(request)[0]
+
     # -- the hook -----------------------------------------------------------
 
     def _get_sorted_waiting_queue(self) -> List[Request]:
@@ -131,6 +236,11 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
         super().on_batch_end(batch)
         if self._priority_policy is not None:
             self._priority_policy.on_batch_end(batch)
+        if self.completion_listeners:
+            for request in batch.requests:
+                if request.completed:
+                    for listener in self.completion_listeners:
+                        listener(request)
 
 
 @contextmanager
