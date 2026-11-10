@@ -25,6 +25,7 @@ from frontier.rl.train import (
     group_advantages,
     imitation_loss,
     pair_agreement,
+    pl_log_prob,
 )
 
 
@@ -114,3 +115,38 @@ def test_group_advantages_favor_the_cheaper_rollout():
     assert (adv[0] > adv[1]).all()
     # a seed's group never mixes with another seed's
     assert np.allclose(adv[2], adv[3])
+
+
+def test_plackett_luce_prefix_probabilities_sum_to_one():
+    import itertools
+
+    torch.manual_seed(0)
+    scores = torch.randn(1, 4)
+    total = 0.0
+    for prefix in itertools.permutations(range(4), 2):
+        rest = [i for i in range(4) if i not in prefix]
+        order = torch.tensor([list(prefix) + rest])
+        total += pl_log_prob(scores, order, torch.tensor([4]), torch.tensor([2])).exp().item()
+    assert total == pytest.approx(1.0, abs=1e-5)
+
+
+def test_gumbel_top_k_samples_the_plackett_luce_distribution(model):
+    scores = torch.tensor([1.0, 0.0, -1.0])
+    generator = torch.Generator().manual_seed(0)
+    first = torch.zeros(3)
+    for _ in range(20000):
+        u = torch.rand(3, generator=generator).clamp(1e-9, 1 - 1e-9)
+        first[torch.argmax(scores - torch.log(-torch.log(u)))] += 1
+    assert torch.allclose(first / first.sum(), torch.softmax(scores, 0), atol=0.02)
+
+
+def test_pl_agent_records_an_ordering_matching_its_priorities(env, model):
+    agent = PolicyAgent(model, "pl", 0, None, 0.0, 2.0)
+    episode = env.run_episode(agent, 0)
+    assert episode.summary["num_completed"] == 36
+    for t in episode.transitions:
+        order = t.info["order"]
+        assert sorted(order) == list(range(t.obs.num_requests))
+        priorities = np.asarray(t.priorities)
+        # the most urgent request in the sampled order has the best (lowest) level
+        assert priorities[order[0]] == priorities.min()

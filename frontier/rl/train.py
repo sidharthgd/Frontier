@@ -103,6 +103,14 @@ class TrainConfig:
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.03
     eval_every: int = 5
+    # "ppo": per-request levels sampled independently, clipped surrogate on the
+    # sum of their log-probabilities. "pl": a Plackett-Luce ranking policy, the
+    # model's scores are the logits of an ordering sampled by Gumbel-top-k
+    # (score / pl_temperature + Gumbel noise); the surrogate uses the
+    # log-probability of the admitted prefix of that ordering, so only choices
+    # that decided who ran count.
+    method: str = "ppo"
+    pl_temperature: float = 4.0
 
     def model_config(self) -> ModelConfig:
         return ModelConfig(
@@ -142,7 +150,8 @@ class PolicyAgent:
 
     unbounded_priorities = False
 
-    def __init__(self, model, decoding="sample", seed=0, teacher=None, beta=0.0):
+    def __init__(self, model, decoding="sample", seed=0, teacher=None, beta=0.0, temperature=1.0):
+        self._temperature = temperature
         self._model = model
         self._decoding = decoding
         self._generator = torch.Generator().manual_seed(seed)
@@ -163,7 +172,15 @@ class PolicyAgent:
                 return levels, info
         modeled = modeled_indices(pi, self._model.config.max_queue_len)
         dist = self._model(collate([pi], self._model.config, [modeled]), with_value=False).dist
-        if self._decoding == "sample":
+        if self._decoding == "pl":
+            scores = dist.scores[0, : len(modeled)] / self._temperature
+            u = torch.rand(scores.shape, generator=self._generator).clamp(1e-9, 1 - 1e-9)
+            order = torch.argsort(-(scores - torch.log(-torch.log(u)))).numpy()
+            ranks = np.empty(len(order), dtype=np.int64)
+            ranks[order] = np.arange(len(order))
+            levels = bucket_ranks(ranks, dist.num_levels)
+            info["order"] = order  # positions within `modeled`, first = most urgent
+        elif self._decoding == "sample":
             levels = dist.sample(self._generator)[0].numpy()
         else:
             expected = (dist.level_log_probs()[0].exp() * torch.arange(dist.num_levels)).sum(-1)
@@ -201,6 +218,8 @@ class Step:
     relevant: bool  # something was left waiting: the ranking mattered
     reward: float
     teacher_rank: Optional[np.ndarray] = None
+    order: Optional[np.ndarray] = None  # Plackett-Luce ordering (positions in `modeled`)
+    num_admitted: int = 0
 
 
 @dataclass
@@ -257,7 +276,8 @@ def run_task(payload) -> Trajectory:
         model = _WORKER["model"]
         model.load_state_dict(state_dict)
         teacher = baseline_agent(config.teacher) if task.teacher else None
-        agent = PolicyAgent(model, task.decoding, task.agent_seed, teacher, task.beta)
+        agent = PolicyAgent(model, task.decoding, task.agent_seed, teacher, task.beta,
+                            config.pl_temperature)
     else:
         agent = baseline_agent(task.kind, task.agent_seed)
     episode = env.run_episode(agent, task.workload_seed)
@@ -268,6 +288,7 @@ def run_task(payload) -> Trajectory:
                 time=t.time, pi=t.info["pi"], modeled=t.info["modeled"],
                 levels=np.asarray(t.info["levels"]), relevant=t.boundary_id is not None,
                 reward=t.reward, teacher_rank=t.info.get("teacher_rank"),
+                order=t.info.get("order"), num_admitted=len(t.admitted_ids),
             ))
     return Trajectory(task, steps, episode.end_time, episode.summary)
 
@@ -470,6 +491,83 @@ def ppo_update(model, optimizer, trajectories, config: TrainConfig, rng) -> Dict
     return out
 
 
+def pl_log_prob(scores: torch.Tensor, order: torch.Tensor, num: torch.Tensor, admitted: torch.Tensor) -> torch.Tensor:
+    """
+    [B] log-probability that a Plackett-Luce ranking with logits `scores` [B, N]
+    starts with the first `admitted` entries of `order` [B, N] (positions into
+    scores), for `num` real entries per row: sum over k < admitted of
+    s[o_k] - logsumexp(s[o_k:]).
+    """
+    n = scores.shape[1]
+    position = torch.arange(n, device=scores.device).unsqueeze(0)
+    valid = position < num.unsqueeze(1)
+    ordered = scores.gather(1, order).masked_fill(~valid, -1e9)
+    suffix = torch.flip(torch.logcumsumexp(torch.flip(ordered, [1]), dim=1), [1])
+    term = torch.where(valid & (position < admitted.unsqueeze(1)), ordered - suffix, torch.zeros_like(ordered))
+    return term.sum(1)
+
+
+def ppo_update_pl(model, optimizer, trajectories, config: TrainConfig, rng) -> Dict[str, float]:
+    advantages = group_advantages(trajectories, config.tau_s)
+    samples = [
+        (s, float(a))
+        for t, adv in zip(trajectories, advantages)
+        for s, a in zip(t.steps, adv)
+        if s.relevant and s.order is not None
+    ]
+    if not samples:
+        return {}
+
+    def forward(chunk):
+        steps = [s for s, _ in chunk]
+        batch, _, _ = _batch(model, steps)
+        scores = model(batch, with_value=False).dist.scores / config.pl_temperature
+        width = scores.shape[1]
+        order = torch.zeros(len(steps), width, dtype=torch.long)
+        for b, s in enumerate(steps):
+            order[b, : len(s.order)] = torch.from_numpy(s.order)
+        num = torch.tensor([len(s.order) for s in steps])
+        admitted = torch.tensor([s.num_admitted for s in steps])
+        return pl_log_prob(scores, order, num, admitted)
+
+    old = torch.zeros(len(samples))
+    model.eval()
+    with torch.no_grad():
+        for idx in _minibatches(len(samples), 512, np.random.default_rng(0)):
+            old[torch.from_numpy(idx)] = forward([samples[i] for i in idx])
+
+    model.train()
+    stats = defaultdict(list)
+    for epoch in range(config.epochs):
+        kls = []
+        for idx in _minibatches(len(samples), config.minibatch_size, rng):
+            chunk = [samples[i] for i in idx]
+            log_prob = forward(chunk)
+            adv = torch.tensor([a for _, a in chunk], dtype=torch.float32)
+            log_ratio = (log_prob - old[torch.from_numpy(idx)]).clamp(-20, 20)
+            ratio = log_ratio.exp()
+            surrogate = torch.minimum(ratio * adv, ratio.clamp(1 - config.clip, 1 + config.clip) * adv)
+            loss = -surrogate.mean()
+            optimizer.zero_grad()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.policy_parameters(), config.max_grad_norm)
+            optimizer.step()
+            with torch.no_grad():
+                kl = ((ratio - 1) - log_ratio).mean().item()
+                clipped = ((ratio - 1).abs() > config.clip).float().mean().item()
+            kls.append(kl)
+            for k, v in (("policy_loss", loss.item()), ("approx_kl", kl),
+                         ("clip_fraction", clipped), ("grad_norm", float(grad_norm))):
+                stats[k].append(v)
+        stats["epochs"] = [epoch + 1]
+        if config.target_kl is not None and np.mean(kls) > config.target_kl:
+            break
+    model.eval()
+    out = {k: float(np.mean(v)) for k, v in stats.items()}
+    out["num_samples"] = len(samples)
+    return out
+
+
 # --- evaluation ----------------------------------------------------------------
 
 EVAL_METRICS = ("mean_session_serving", "p99_session_serving", "mean_ttft", "p99_ttft", "cached_prefill_fraction")
@@ -584,11 +682,13 @@ class Trainer:
 
         optimizer = torch.optim.Adam(self.model.policy_parameters(), lr=c.learning_rate)
         for it in range(1, c.ppo_iterations + 1):
-            tasks = [Task(l, s, "policy", agent_seed=1_000_000 * g + s, teacher=c.imitation_coef > 0)
+            tasks = [Task(l, s, "policy", agent_seed=1_000_000 * g + s, teacher=c.imitation_coef > 0,
+                          decoding="pl" if c.method == "pl" else "sample")
                      for l in c.loads for s in self.seeds(c.seeds_per_iteration)
                      for g in range(c.group_size)]
             trajectories = self.pool.run(self.model.state_dict(), tasks)
-            stats = ppo_update(self.model, optimizer, trajectories, c, self.rng)
+            update = ppo_update_pl if c.method == "pl" else ppo_update
+            stats = update(self.model, optimizer, trajectories, c, self.rng)
             serving = defaultdict(list)
             for t in trajectories:
                 serving[t.task.load].append(t.summary["mean_session_serving"])
