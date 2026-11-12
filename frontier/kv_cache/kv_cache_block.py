@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Hashable, Optional
 
 
@@ -21,6 +21,8 @@ class KVCacheBlock:
     binding_epoch: int = 0
     prev_free_block: Optional["KVCacheBlock"] = None
     next_free_block: Optional["KVCacheBlock"] = None
+    # the frozen binding for the current (hash, creator, epoch), rebuilt on bind
+    _binding: Optional[KVCacheBlockBinding] = field(default=None, repr=False, compare=False)
 
     def incr_ref(self) -> None:
         self.ref_cnt += 1
@@ -46,17 +48,20 @@ class KVCacheBlock:
             return None
         if self._creator_request_id is None or self.binding_epoch <= 0:
             raise ValueError("Bound KV cache block has incomplete identity.")
-        return KVCacheBlockBinding(
-            block_hash=self._block_hash,
-            block_id=int(self.block_id),
-            creator_request_id=int(self._creator_request_id),
-            binding_epoch=int(self.binding_epoch),
-        )
+        if self._binding is None:
+            self._binding = KVCacheBlockBinding(
+                block_hash=self._block_hash,
+                block_id=int(self.block_id),
+                creator_request_id=int(self._creator_request_id),
+                binding_epoch=int(self.binding_epoch),
+            )
+        return self._binding
 
     def bind(self, block_hash: Hashable, creator_request_id: int) -> KVCacheBlockBinding:
         if self._block_hash is not None:
             raise ValueError("KV cache block hash is already assigned.")
         self.binding_epoch += 1
+        self._binding = None
         self._block_hash = block_hash
         self._creator_request_id = int(creator_request_id)
         binding = self.binding
@@ -65,5 +70,6 @@ class KVCacheBlock:
         return binding
 
     def reset_binding(self) -> None:
+        self._binding = None
         self._block_hash = None
         self._creator_request_id = None

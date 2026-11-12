@@ -189,14 +189,18 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
         self._install_free_order()
         pool = self._kv_cache_manager.block_pool
         hits, first_out = 0, None
+        lookup = pool.cached_block_hash_to_block.get
         for block_hash in request.prompt_block_hash_ids(self.block_size):
-            cached = pool.cached_block_hash_to_block.get(block_hash)
+            cached = lookup(block_hash)
             if not cached:
                 break
             hits += 1
-            block = next(iter(cached.values()))
-            if block.ref_cnt == 0 and (first_out is None or block._free_seq < first_out):
-                first_out = block._free_seq
+            for block in cached.values():
+                break
+            if block.ref_cnt == 0:
+                free_seq = block._free_seq
+                if first_out is None or free_seq < first_out:
+                    first_out = free_seq
         distance = -1 if first_out is None else pool.free_block_queue._rl_order.ahead(first_out)
         return hits * self.block_size, distance
 
