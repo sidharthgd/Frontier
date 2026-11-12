@@ -83,7 +83,7 @@ async def send(session, url, model, row, index, origin, results):
     })
 
 
-async def replay(trace: pd.DataFrame, url: str, model: str, lead_s: float):
+async def replay(trace: pd.DataFrame, url: str, model: str, lead_s: float, sequential: bool = False):
     import aiohttp
 
     results = []
@@ -91,10 +91,17 @@ async def replay(trace: pd.DataFrame, url: str, model: str, lead_s: float):
     # streamed lines can exceed aiohttp's default 512 KB line limit
     async with aiohttp.ClientSession(connector=connector, read_bufsize=1 << 26) as session:
         origin = time.perf_counter() + lead_s
-        await asyncio.gather(*[
-            send(session, url, model, row, i, origin, results)
-            for i, row in enumerate(trace.itertuples())
-        ])
+        if sequential:
+            # one request at a time, each sent when the previous has finished
+            # (arrived_at is ignored), for timing single requests of any length
+            for i, row in enumerate(trace.itertuples()):
+                row = row._replace(arrived_at=time.perf_counter() - origin)
+                await send(session, url, model, row, i, origin, results)
+        else:
+            await asyncio.gather(*[
+                send(session, url, model, row, i, origin, results)
+                for i, row in enumerate(trace.itertuples())
+            ])
     return pd.DataFrame(results).sort_values("index")
 
 
@@ -105,12 +112,14 @@ def main() -> None:
     parser.add_argument("--url", default="http://localhost:8000/v1/completions")
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--lead-s", type=float, default=2.0)
+    parser.add_argument("--sequential", action="store_true",
+                        help="send requests one after another instead of at their arrival times")
     args = parser.parse_args()
 
     trace = pd.read_csv(args.trace)
     trace = trace.sort_values("arrived_at").reset_index(drop=True)
     trace["arrived_at"] -= trace["arrived_at"].iloc[0]
-    out = asyncio.run(replay(trace, args.url, args.model, args.lead_s))
+    out = asyncio.run(replay(trace, args.url, args.model, args.lead_s, args.sequential))
     out.to_csv(args.output, index=False)
     ok = out[out.error == ""]
     print(f"{len(ok)}/{len(out)} requests ok; mean TTFT {ok.ttft.mean():.3f}s, "

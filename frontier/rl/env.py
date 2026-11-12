@@ -108,6 +108,24 @@ def a100_llama31_8b(**overrides) -> "WorkloadSpec":
     return WorkloadSpec(**spec)
 
 
+def h200_nemotron_1m(**overrides) -> "WorkloadSpec":
+    """
+    H200 NVL + Nemotron-8B-UltraLong-1M (the Llama-3.1-8B architecture with a
+    1M context), as profiled by run_h200_profile.sh. num_blocks and
+    max_model_len must match the real vLLM server (its startup log and
+    --max-model-len); the defaults here are placeholders until validated.
+    """
+    spec = dict(
+        model="llama3.1-8b-1m", device="h200", network_device="h200_dgx",
+        max_tokens_in_batch=2048, batch_size_cap=256, num_blocks=None,
+        decode_cuda_graph_mode="piecewise", model_cpu_overhead=False,
+        max_model_len=1048576, prediction_max_tokens_per_request=1048576,
+        prediction_max_batch_size=256, max_tokens=1048576,
+    )
+    spec.update(overrides)
+    return WorkloadSpec(**spec)
+
+
 def simulation_args(
     spec: WorkloadSpec, seed: int, output_dir: str, log_level: str = "error"
 ) -> List[str]:

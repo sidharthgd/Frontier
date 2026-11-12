@@ -32,6 +32,7 @@ to <output_dir>/metrics.jsonl, weights to best.pt / latest.pt.
 import argparse
 import dataclasses
 import json
+import math
 import multiprocessing as mp
 import os
 import time
@@ -71,7 +72,10 @@ class TrainConfig:
     seed: int = 0
     # reward
     ttft_threshold: float = 30.0
-    ttft_hinge_weight: float = 2.0
+    ttft_hinge_weight: float = 0.0
+    # weight of sum over calls of (TTFT beyond the threshold)^2, in seconds^2;
+    # 0.01 prices a call's 100 s excess wait like 100 request-seconds of e2e
+    ttft_sq_weight: float = 0.01
     tau_s: float = 120.0
     # model
     num_priority_levels: int = 16
@@ -82,7 +86,7 @@ class TrainConfig:
     init_middle_level_prob: float = 0.25
     init_checkpoint: Optional[str] = None
     # imitation
-    teacher: str = "sjf_uncached"
+    teacher: str = "sjf_uncached_age50"
     imitation_iterations: int = 4
     imitation_initial_seeds: int = 8  # per load, teacher only
     imitation_seeds: int = 4  # per load per iteration, mixed
@@ -111,6 +115,9 @@ class TrainConfig:
     # that decided who ran count.
     method: str = "ppo"
     pl_temperature: float = 4.0
+    # "set": credit the probability that exactly the admitted calls made the cut
+    # (what decides the outcome); "ordered": also their exact order (noisier)
+    pl_likelihood: str = "set"
 
     def model_config(self) -> ModelConfig:
         return ModelConfig(
@@ -251,7 +258,8 @@ def _env(config: TrainConfig, load: int):
                 enable_prefix_caching=True, prediction_rounding_bits=5,
             ),
             reward_config=RewardConfig(
-                weights={"e2e": 1.0, "ttft_hinge": config.ttft_hinge_weight},
+                weights={"e2e": 1.0, "ttft_hinge": config.ttft_hinge_weight,
+                         "ttft_excess_sq": config.ttft_sq_weight},
                 ttft_threshold=config.ttft_threshold,
             ),
             num_priority_levels=config.num_priority_levels,
@@ -507,6 +515,40 @@ def pl_log_prob(scores: torch.Tensor, order: torch.Tensor, num: torch.Tensor, ad
     return term.sum(1)
 
 
+def pl_set_log_prob(
+    scores: torch.Tensor, in_set: torch.Tensor, valid: torch.Tensor,
+    num_grid: int = 512, t_min: float = 1e-3, t_max: float = 1e5,
+) -> torch.Tensor:
+    """
+    [B] log P(the m entries marked in_set are exactly the top m of a
+    Plackett-Luce ranking with logits `scores`), for `valid` entries per row.
+
+    Plackett-Luce ranks by arrival times T_i ~ Exp(w_i), w = exp(score). The
+    set S is the top m when its slowest member M = max_S T_i arrives before
+    every outsider does:
+
+        P(S) = ∫ d/dt[ prod_{i in S} (1 - e^{-w_i t}) ] * e^{-W_out t} dt,
+        W_out = sum of outsiders' w,
+
+    and d/dt of the product is F_S(t) * sum_{i in S} w_i e^{-w_i t} / (1 - e^{-w_i t}).
+    The integral is taken numerically on a log-spaced grid of t (differentiable).
+    Weights are normalized to sum 1; the probability does not depend on that scale.
+    """
+    logw = torch.log_softmax(scores.masked_fill(~valid, -1e9), dim=-1)
+    w = logw.exp().clamp_min(1e-30)
+    x = torch.linspace(math.log(t_min), math.log(t_max), num_grid, device=scores.device)
+    t = x.exp()
+    wt = w.unsqueeze(-1) * t  # [B, N, G]
+    log1m = torch.log(-torch.expm1(-wt))
+    member = (in_set & valid).unsqueeze(-1)
+    log_f = torch.where(member, log1m, torch.zeros_like(log1m)).sum(1)  # [B, G]
+    term = (logw.unsqueeze(-1) - wt - log1m).masked_fill(~member, -1e30)
+    log_sum = torch.logsumexp(term, dim=1)  # [B, G]
+    w_out = (w * (valid & ~in_set)).sum(1)  # [B]
+    log_integrand = log_f + log_sum - w_out.unsqueeze(-1) * t + x  # + x: dt = t dx
+    return torch.logsumexp(log_integrand, dim=-1) + math.log(float(x[1] - x[0]))
+
+
 def ppo_update_pl(model, optimizer, trajectories, config: TrainConfig, rng) -> Dict[str, float]:
     advantages = group_advantages(trajectories, config.tau_s)
     samples = [
@@ -528,7 +570,14 @@ def ppo_update_pl(model, optimizer, trajectories, config: TrainConfig, rng) -> D
             order[b, : len(s.order)] = torch.from_numpy(s.order)
         num = torch.tensor([len(s.order) for s in steps])
         admitted = torch.tensor([s.num_admitted for s in steps])
-        return pl_log_prob(scores, order, num, admitted)
+        if config.pl_likelihood == "ordered":
+            return pl_log_prob(scores, order, num, admitted)
+        position = torch.arange(width).unsqueeze(0)
+        valid = position < num.unsqueeze(1)
+        # the entries at the first `admitted` places of the sampled order
+        in_set = torch.zeros_like(valid)
+        in_set.scatter_(1, order, position < admitted.unsqueeze(1))
+        return pl_set_log_prob(scores, in_set & valid, valid)
 
     old = torch.zeros(len(samples))
     model.eval()

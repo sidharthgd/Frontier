@@ -17,6 +17,11 @@ Baseline agents, by name (as in vidur/rl/agents.py):
                                 blocks) is sized g * its cached tokens smaller
     sjf_uncached_deadline<d>    sjf_uncached, but calls waiting longer than d seconds
                                 go first (oldest first)
+    sjf_uncached_cold<q>_ramp<t>  sjf_uncached, but a call in the top q percent of recent calls by
+                                uncached tokens ("cold") has its size shrink linearly with its
+                                wait, reaching zero after t seconds. Others are unchanged.
+    sjf_uncached_qcold<q>_ramp<t>  the same, but "cold" means the top q percent of the calls
+                                waiting right now (no history window)
     sjf_uncached_hrrn<t>        uncached tokens / (1 + wait / t): a call's size shrinks in
                                 proportion to how long it has waited (highest response
                                 ratio next, as in HRRN scheduling)
@@ -136,9 +141,44 @@ def _hrrn_size(scale_s: float):
     return size
 
 
+class ColdRampAgent(BaseAgent):
+    """
+    sjf_uncached, with targeted aging for the most expensive calls. A call is
+    cold if its uncached tokens are in the top `top_percent` of the last
+    `window` calls seen (a relative threshold, so no token counts to tune); a
+    cold call's size is scaled by max(0, 1 - wait / ramp_s).
+    """
+
+    unbounded_priorities = True
+
+    def __init__(self, top_percent: float, ramp_s: float, window: int = 200, in_queue: bool = False) -> None:
+        from collections import deque
+
+        self._in_queue = in_queue
+        self._quantile = 1.0 - top_percent / 100.0
+        self._ramp_s = ramp_s
+        self._recent = deque(maxlen=window)
+        self._seen = set()
+
+    def act(self, obs: Observation):
+        uncached = _uncached(obs)
+        if self._in_queue:
+            threshold = float(np.quantile(uncached, self._quantile))
+        else:
+            for request_id, value in zip(obs.request_ids, uncached):
+                if request_id not in self._seen:
+                    self._seen.add(request_id)
+                    self._recent.append(float(value))
+            threshold = float(np.quantile(self._recent, self._quantile))
+        cold = (uncached >= threshold) & (uncached > 0)
+        ramp = np.clip(1.0 - obs.waiting_feature("wait_time") / self._ramp_s, 0.0, 1.0)
+        return _ranks(np.where(cold, uncached * ramp, uncached), obs), {}
+
+
 _SJF = re.compile(r"^sjf_(?P<key>prefill|total)(?:_age(?P<age>[0-9.]+))?$")
 _RULE = re.compile(r"^(?P<rule>sjf_uncached|session_fewest|oracle_cost)(?:_age(?P<age>[0-9.]+))?$")
 _EVICT = re.compile(r"^sjf_uncached_evict(?P<g>[0-9.]+)_(?P<k>[0-9]+)$")
+_COLD = re.compile(r"^sjf_uncached_(?P<kind>q?cold)(?P<q>[0-9.]+)_ramp(?P<t>[0-9.]+)$")
 _HRRN = re.compile(r"^sjf_uncached_hrrn(?P<t>[0-9.]+)$")
 _DEADLINE = re.compile(r"^sjf_uncached_deadline(?P<d>[0-9.]+)$")
 
@@ -166,6 +206,9 @@ def baseline_agent(name: str, seed: Optional[int] = None) -> BaseAgent:
     match = _DEADLINE.match(name)
     if match:
         return SizeAgent(_deadline_size(float(match["d"])))
+    match = _COLD.match(name)
+    if match:
+        return ColdRampAgent(float(match["q"]), float(match["t"]), in_queue=match["kind"] == "qcold")
     match = _HRRN.match(name)
     if match:
         return SizeAgent(_hrrn_size(float(match["t"])))

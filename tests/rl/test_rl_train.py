@@ -150,3 +150,24 @@ def test_pl_agent_records_an_ordering_matching_its_priorities(env, model):
         priorities = np.asarray(t.priorities)
         # the most urgent request in the sampled order has the best (lowest) level
         assert priorities[order[0]] == priorities.min()
+
+
+def test_squared_excess_reward_matches_per_call_squares_however_time_is_split():
+    from types import SimpleNamespace
+
+    from frontier.rl.reward import RewardConfig, transition_components
+
+    def episode(edges):
+        transitions = [SimpleNamespace(time=t) for t in edges]
+        # one call: arrives at 0, first token at 30 (excess 20 s past tau = 10), finishes at 35
+        request = SimpleNamespace(arrived_at=0.0, first_token_at=30.0, completed_at=35.0, num_decode_tokens=10)
+        return SimpleNamespace(transitions=transitions, requests=[request], end_time=40.0)
+
+    config = RewardConfig(weights={"ttft_excess_sq": 1.0}, ttft_threshold=10.0)
+    for edges in ([0.0], [0.0, 20.0], [0.0, 12.0, 25.0, 31.0]):
+        total = sum(c["ttft_excess_sq"] for c in transition_components(episode(edges), config))
+        assert total == pytest.approx(20.0**2)
+    # a call that has not reached its first token by the end keeps accruing to the end
+    pending = SimpleNamespace(arrived_at=0.0, first_token_at=None, completed_at=None, num_decode_tokens=10)
+    ep = SimpleNamespace(transitions=[SimpleNamespace(time=0.0)], requests=[pending], end_time=40.0)
+    assert transition_components(ep, config)[0]["ttft_excess_sq"] == pytest.approx(30.0**2)

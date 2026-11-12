@@ -8,6 +8,9 @@ per-request metric summed over requests:
     ttft            ∫ #(requests without a first token) = Σ TTFT
     e2e_hinge       ∫ #(in system, age > e2e_threshold)  = Σ max(0, e2e - τ)
     ttft_hinge      ∫ #(no first token, age > ttft_threshold)
+    ttft_excess_sq  ∫ Σ_waiting 2 * max(0, age - ttft_threshold) dt = Σ max(0, TTFT - τ)²
+                    (a call's cost grows with the square of its excess wait, so one
+                    very long wait counts far more than many short ones)
 
 Transition k is credited with what accrues between its decision and the next
 kept one (the last runs to the end of the episode). What accrued before the
@@ -27,7 +30,7 @@ import numpy as np
 if TYPE_CHECKING:
     from frontier.rl.env import Episode
 
-COMPONENTS = ("e2e", "e2e_normalized", "ttft", "e2e_hinge", "ttft_hinge")
+COMPONENTS = ("e2e", "e2e_normalized", "ttft", "e2e_hinge", "ttft_hinge", "ttft_excess_sq")
 
 
 @dataclass
@@ -81,4 +84,16 @@ def transition_components(
             out[name] = np.zeros(len(edges) - 1)
         else:
             out[name] = _overlap(arrived + threshold, np.maximum(stop, arrived + threshold), edges).sum(axis=1)
+    if config.ttft_threshold is None:
+        out["ttft_excess_sq"] = np.zeros(len(edges) - 1)
+    else:
+        # the cost of a call that waited w past tau is w^2; as it waits, that
+        # accrues at 2 * (age - tau) per second, so each interval gets the
+        # difference of squares of the excess at its two ends
+        start = arrived + config.ttft_threshold
+        lo = np.maximum(edges[:-1, None], start[None, :])
+        hi = np.minimum(edges[1:, None], first[None, :])
+        out["ttft_excess_sq"] = np.where(
+            hi > lo, (hi - start[None, :]) ** 2 - (lo - start[None, :]) ** 2, 0.0
+        ).sum(axis=1)
     return [{k: float(v[i]) for k, v in out.items()} for i in range(len(edges) - 1)]

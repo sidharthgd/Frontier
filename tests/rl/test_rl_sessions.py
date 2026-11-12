@@ -126,3 +126,29 @@ def test_shared_prefix_is_one_chain_across_sessions(calls_csv):
         assert len(a.block_hash_ids) == len(b.block_hash_ids)
         # beyond the shared prefix a context still continues its own chain
         assert a.block_hash_ids[100:] == b.block_hash_ids[100:]
+
+
+def test_cold_ramp_agent_only_boosts_expensive_calls():
+    from types import SimpleNamespace
+
+    from frontier.rl.agents import ColdRampAgent
+    from frontier.rl.observation import WAITING_FEATURES
+
+    def obs(uncached, wait):
+        n = len(uncached)
+        rows = np.zeros((n, len(WAITING_FEATURES)))
+        rows[:, WAITING_FEATURES.index("prompt_tokens")] = uncached
+        rows[:, WAITING_FEATURES.index("wait_time")] = wait
+        return SimpleNamespace(
+            num_requests=n, request_ids=np.arange(n), arrival_times=np.arange(n, dtype=float),
+            waiting=rows, waiting_feature=lambda name: rows[:, WAITING_FEATURES.index(name)],
+        )
+
+    agent = ColdRampAgent(top_percent=25, ramp_s=100)
+    sizes = [10, 20, 30, 40, 5000]
+    fresh, _ = agent.act(obs(sizes, [0] * 5))
+    assert list(np.argsort(fresh)) == [0, 1, 2, 3, 4]  # plain shortest-first
+    aged, _ = agent.act(obs(sizes, [0, 0, 0, 0, 100]))
+    assert aged[4] == 0  # the cold call has finished its ramp: it goes first
+    waited_small, _ = agent.act(obs(sizes, [99, 0, 0, 0, 0]))
+    assert waited_small[0] == 0 and waited_small[4] == 4  # a cheap call gets no boost beyond sjf
