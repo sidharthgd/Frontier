@@ -397,6 +397,8 @@ class RequestRecord:
     num_prefill_tokens: int
     num_decode_tokens: int
     session_id: Optional[int]
+    # position in its session; (session_id, call_index) names a call across runs
+    call_index: Optional[int] = None
     first_token_at: Optional[float] = None
     completed_at: Optional[float] = None
     token_times: List[float] = field(default_factory=list)
@@ -441,6 +443,7 @@ class AgentPriorityPolicy(PriorityPolicy):
                 num_prefill_tokens=int(request.num_prefill_tokens),
                 num_decode_tokens=int(request.num_decode_tokens),
                 session_id=request.session_id,
+                call_index=getattr(request, "_rl_call_index", None),
             )
             self.records[request.id] = record
         return record

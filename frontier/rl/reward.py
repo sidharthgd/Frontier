@@ -11,6 +11,9 @@ per-request metric summed over requests:
     ttft_excess_sq  ∫ Σ_waiting 2 * max(0, age - ttft_threshold) dt = Σ max(0, TTFT - τ)²
                     (a call's cost grows with the square of its excess wait, so one
                     very long wait counts far more than many short ones)
+    ttft_ref_sq     the same with a per-call threshold: max(floor, k * the TTFT the
+                    same call had under a reference run (FCFS)), so a call is only
+                    charged for waiting longer than FCFS would have made it wait
 
 Transition k is credited with what accrues between its decision and the next
 kept one (the last runs to the end of the episode). What accrued before the
@@ -30,7 +33,7 @@ import numpy as np
 if TYPE_CHECKING:
     from frontier.rl.env import Episode
 
-COMPONENTS = ("e2e", "e2e_normalized", "ttft", "e2e_hinge", "ttft_hinge", "ttft_excess_sq")
+COMPONENTS = ("e2e", "e2e_normalized", "ttft", "e2e_hinge", "ttft_hinge", "ttft_excess_sq", "ttft_ref_sq")
 
 
 @dataclass
@@ -38,6 +41,11 @@ class RewardConfig:
     weights: Dict[str, float] = field(default_factory=lambda: {"e2e": 1.0})
     e2e_threshold: Optional[float] = None
     ttft_threshold: Optional[float] = None
+    # (session_id, call_index) -> TTFT of that call under the reference run (FCFS);
+    # request ids differ between runs, calls do not
+    ttft_reference: Optional[Dict[int, float]] = None
+    ttft_reference_k: float = 2.0
+    ttft_reference_floor: float = 5.0
 
     def __post_init__(self):
         unknown = set(self.weights) - set(COMPONENTS)
@@ -52,6 +60,20 @@ def _overlap(starts: np.ndarray, ends: np.ndarray, edges: np.ndarray) -> np.ndar
     lo = np.maximum(edges[:-1, None], starts[None, :])
     hi = np.minimum(edges[1:, None], ends[None, :])
     return np.clip(hi - lo, 0.0, None)
+
+
+def _excess_sq(edges: np.ndarray, first: np.ndarray, start: np.ndarray) -> np.ndarray:
+    """Per interval, the growth of max(0, wait - threshold)² for calls waiting for
+    their first token, where `start` is arrival + threshold. The cost of a call
+    that waited w past its threshold is w²; as it waits, that accrues at
+    2 * (age - threshold) per second, so each interval gets the difference of
+    squares of the excess at its two ends."""
+    finite = np.isfinite(start)
+    start = np.where(finite, start, 0.0)
+    lo = np.maximum(edges[:-1, None], start[None, :])
+    hi = np.minimum(edges[1:, None], first[None, :])
+    grown = np.where(hi > lo, (hi - start[None, :]) ** 2 - (lo - start[None, :]) ** 2, 0.0)
+    return (grown * finite[None, :]).sum(axis=1)
 
 
 def transition_components(
@@ -84,16 +106,13 @@ def transition_components(
             out[name] = np.zeros(len(edges) - 1)
         else:
             out[name] = _overlap(arrived + threshold, np.maximum(stop, arrived + threshold), edges).sum(axis=1)
-    if config.ttft_threshold is None:
-        out["ttft_excess_sq"] = np.zeros(len(edges) - 1)
+    out["ttft_excess_sq"] = _excess_sq(
+        edges, first, arrived + (config.ttft_threshold if config.ttft_threshold is not None else np.inf)
+    )
+    if config.ttft_reference is None:
+        out["ttft_ref_sq"] = np.zeros(len(edges) - 1)
     else:
-        # the cost of a call that waited w past tau is w^2; as it waits, that
-        # accrues at 2 * (age - tau) per second, so each interval gets the
-        # difference of squares of the excess at its two ends
-        start = arrived + config.ttft_threshold
-        lo = np.maximum(edges[:-1, None], start[None, :])
-        hi = np.minimum(edges[1:, None], first[None, :])
-        out["ttft_excess_sq"] = np.where(
-            hi > lo, (hi - start[None, :]) ** 2 - (lo - start[None, :]) ** 2, 0.0
-        ).sum(axis=1)
+        ref = np.array([config.ttft_reference.get((r.session_id, r.call_index), np.inf) for r in reqs])
+        threshold = np.maximum(config.ttft_reference_floor, config.ttft_reference_k * ref)
+        out["ttft_ref_sq"] = _excess_sq(edges, first, arrived + threshold)
     return [{k: float(v[i]) for k, v in out.items()} for i in range(len(edges) - 1)]

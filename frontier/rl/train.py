@@ -76,6 +76,10 @@ class TrainConfig:
     # weight of sum over calls of (TTFT beyond the threshold)^2, in seconds^2;
     # 0.01 prices a call's 100 s excess wait like 100 request-seconds of e2e
     ttft_sq_weight: float = 0.01
+    # squared excess of a call's TTFT over ttft_ref_k * its FCFS TTFT (0 = off)
+    ttft_ref_weight: float = 0.0
+    ttft_ref_k: float = 2.0
+    ttft_ref_floor: float = 5.0
     tau_s: float = 120.0
     # model
     num_priority_levels: int = 16
@@ -259,8 +263,10 @@ def _env(config: TrainConfig, load: int):
             ),
             reward_config=RewardConfig(
                 weights={"e2e": 1.0, "ttft_hinge": config.ttft_hinge_weight,
-                         "ttft_excess_sq": config.ttft_sq_weight},
+                         "ttft_excess_sq": config.ttft_sq_weight,
+                         "ttft_ref_sq": config.ttft_ref_weight},
                 ttft_threshold=config.ttft_threshold,
+                ttft_reference_k=config.ttft_ref_k, ttft_reference_floor=config.ttft_ref_floor,
             ),
             num_priority_levels=config.num_priority_levels,
             output_dir=f"/tmp/frontier_rl_train_{os.getpid()}",
@@ -272,6 +278,20 @@ def _init_worker(config: TrainConfig) -> None:
     torch.set_num_threads(1)
     _WORKER["config"] = config
     _WORKER["model"] = SchedulerModel(config.model_config()).eval()
+
+
+def _fcfs_ttft(env, load: int, seed: int) -> Dict[tuple, float]:
+    """TTFT of every request under FCFS for this workload seed (cached per worker);
+    calls are keyed by (session, call index)."""
+    from frontier.rl.agents import baseline_agent
+
+    cache = _WORKER.setdefault("fcfs_ttft", {})
+    if (load, seed) not in cache:
+        env.reward_config.ttft_reference = None
+        episode = env.run_episode(baseline_agent("fcfs"), seed)
+        cache[(load, seed)] = {(r.session_id, r.call_index): r.first_token_at - r.arrived_at
+                               for r in episode.requests if r.first_token_at is not None}
+    return cache[(load, seed)]
 
 
 def run_task(payload) -> Trajectory:
@@ -288,6 +308,8 @@ def run_task(payload) -> Trajectory:
                             config.pl_temperature)
     else:
         agent = baseline_agent(task.kind, task.agent_seed)
+    if config.ttft_ref_weight > 0:
+        env.reward_config.ttft_reference = _fcfs_ttft(env, task.load, task.workload_seed)
     episode = env.run_episode(agent, task.workload_seed)
     steps = []
     if task.kind == "policy":

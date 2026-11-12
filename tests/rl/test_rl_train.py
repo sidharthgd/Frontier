@@ -171,3 +171,25 @@ def test_squared_excess_reward_matches_per_call_squares_however_time_is_split():
     pending = SimpleNamespace(arrived_at=0.0, first_token_at=None, completed_at=None, num_decode_tokens=10)
     ep = SimpleNamespace(transitions=[SimpleNamespace(time=0.0)], requests=[pending], end_time=40.0)
     assert transition_components(ep, config)[0]["ttft_excess_sq"] == pytest.approx(30.0**2)
+
+
+def test_reference_penalty_charges_only_waiting_beyond_k_times_the_reference():
+    from types import SimpleNamespace
+
+    from frontier.rl.reward import RewardConfig, transition_components
+
+    def request(id, first, done=100.0):
+        return SimpleNamespace(session_id=0, call_index=id, arrived_at=0.0, first_token_at=first, completed_at=done, num_decode_tokens=10)
+
+    # id 0: FCFS waited 10 s, threshold 2 * 10 = 20, now waits 50 -> excess 30
+    # id 1: FCFS waited 10 s, now waits 15 -> under threshold, free
+    # id 2: no reference -> free; id 3: reference 1 s, floor 5 s * ... max(5, 2) = 5, waits 9 -> excess 4
+    reqs = [request(0, 50.0), request(1, 15.0), request(2, 80.0), request(3, 9.0)]
+    config = RewardConfig(
+        weights={"ttft_ref_sq": 1.0}, ttft_reference={(0, 0): 10.0, (0, 1): 10.0, (0, 3): 1.0},
+        ttft_reference_k=2.0, ttft_reference_floor=5.0,
+    )
+    for edges in ([0.0], [0.0, 30.0], [0.0, 7.0, 21.0, 60.0]):
+        ep = SimpleNamespace(transitions=[SimpleNamespace(time=t) for t in edges], requests=reqs, end_time=100.0)
+        total = sum(c["ttft_ref_sq"] for c in transition_components(ep, config))
+        assert total == pytest.approx(30.0**2 + 4.0**2)
