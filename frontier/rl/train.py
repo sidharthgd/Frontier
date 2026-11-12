@@ -615,16 +615,24 @@ def ppo_update_pl(model, optimizer, trajectories, config: TrainConfig, rng) -> D
             chunk = [samples[i] for i in idx]
             log_prob = forward(chunk)
             adv = torch.tensor([a for _, a in chunk], dtype=torch.float32)
-            log_ratio = (log_prob - old[torch.from_numpy(idx)]).clamp(-20, 20)
+            log_ratio = (log_prob - old[torch.from_numpy(idx)]).clamp(-5, 5)
             ratio = log_ratio.exp()
             surrogate = torch.minimum(ratio * adv, ratio.clamp(1 - config.clip, 1 + config.clip) * adv)
+            # dual clip: with a negative advantage the clipped objective is unbounded
+            # in the ratio, so one outlier sample would dominate the update
+            surrogate = torch.where(adv < 0, torch.maximum(surrogate, 3.0 * adv), surrogate)
             loss = -surrogate.mean()
+            with torch.no_grad():
+                kl = ((ratio - 1) - log_ratio).mean().item()
+            if config.target_kl is not None and kl > 10 * config.target_kl:
+                kls.append(kl)  # the policy has already left the trust region: no further step
+                stats["skipped_steps"].append(1.0)
+                continue
             optimizer.zero_grad()
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.policy_parameters(), config.max_grad_norm)
             optimizer.step()
             with torch.no_grad():
-                kl = ((ratio - 1) - log_ratio).mean().item()
                 clipped = ((ratio - 1).abs() > config.clip).float().mean().item()
             kls.append(kl)
             for k, v in (("policy_loss", loss.item()), ("approx_kl", kl),
@@ -634,7 +642,8 @@ def ppo_update_pl(model, optimizer, trajectories, config: TrainConfig, rng) -> D
         if config.target_kl is not None and np.mean(kls) > config.target_kl:
             break
     model.eval()
-    out = {k: float(np.mean(v)) for k, v in stats.items()}
+    out = {k: float(np.mean(v)) for k, v in stats.items() if k != "skipped_steps"}
+    out["skipped_steps"] = float(len(stats.get("skipped_steps", [])))
     out["num_samples"] = len(samples)
     return out
 
