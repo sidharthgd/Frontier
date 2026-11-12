@@ -218,6 +218,9 @@ class Task:
     decoding: str = "sample"
     teacher: bool = False
     beta: float = 0.0
+    # FCFS TTFT of every call of this (load, seed), keyed (session, call index);
+    # computed once per iteration and shared, see Trainer.attach_references
+    ttft_reference: Optional[Dict[tuple, float]] = None
 
 
 @dataclass
@@ -239,6 +242,8 @@ class Trajectory:
     steps: List[Step]
     end_time: float
     summary: Dict[str, float]
+    # per-call TTFT, filled for "fcfs" tasks (they are the reward's reference)
+    call_ttft: Optional[Dict[tuple, float]] = None
 
 
 _WORKER: Dict[str, object] = {}
@@ -280,18 +285,9 @@ def _init_worker(config: TrainConfig) -> None:
     _WORKER["model"] = SchedulerModel(config.model_config()).eval()
 
 
-def _fcfs_ttft(env, load: int, seed: int) -> Dict[tuple, float]:
-    """TTFT of every request under FCFS for this workload seed (cached per worker);
-    calls are keyed by (session, call index)."""
-    from frontier.rl.agents import baseline_agent
-
-    cache = _WORKER.setdefault("fcfs_ttft", {})
-    if (load, seed) not in cache:
-        env.reward_config.ttft_reference = None
-        episode = env.run_episode(baseline_agent("fcfs"), seed)
-        cache[(load, seed)] = {(r.session_id, r.call_index): r.first_token_at - r.arrived_at
-                               for r in episode.requests if r.first_token_at is not None}
-    return cache[(load, seed)]
+def _call_ttft(episode) -> Dict[tuple, float]:
+    return {(r.session_id, r.call_index): r.first_token_at - r.arrived_at
+            for r in episode.requests if r.first_token_at is not None}
 
 
 def run_task(payload) -> Trajectory:
@@ -308,8 +304,7 @@ def run_task(payload) -> Trajectory:
                             config.pl_temperature)
     else:
         agent = baseline_agent(task.kind, task.agent_seed)
-    if config.ttft_ref_weight > 0:
-        env.reward_config.ttft_reference = _fcfs_ttft(env, task.load, task.workload_seed)
+    env.reward_config.ttft_reference = task.ttft_reference
     episode = env.run_episode(agent, task.workload_seed)
     steps = []
     if task.kind == "policy":
@@ -320,7 +315,8 @@ def run_task(payload) -> Trajectory:
                 reward=t.reward, teacher_rank=t.info.get("teacher_rank"),
                 order=t.info.get("order"), num_admitted=len(t.admitted_ids),
             ))
-    return Trajectory(task, steps, episode.end_time, episode.summary)
+    return Trajectory(task, steps, episode.end_time, episode.summary,
+                      _call_ttft(episode) if task.kind == "fcfs" else None)
 
 
 class Pool:
@@ -727,6 +723,19 @@ class Trainer:
             self.save("best.pt")
         self.log({"phase": phase, "iteration": iteration, "eval": metrics, "score": s, "best": self.best})
 
+    def attach_references(self, tasks: List[Task]) -> List[Task]:
+        """Give each task the FCFS per-call TTFT of its (load, seed) for the
+        FCFS-relative reward, simulating each FCFS episode once, not per task."""
+        if self.config.ttft_ref_weight <= 0:
+            return tasks
+        refs = self.__dict__.setdefault("_references", {})
+        missing = sorted({(t.load, t.workload_seed) for t in tasks} - set(refs))
+        for t in self.pool.run(None, [Task(l, s, "fcfs") for l, s in missing]):
+            refs[(t.task.load, t.task.workload_seed)] = t.call_ttft
+        for t in tasks:
+            t.ttft_reference = refs[(t.load, t.workload_seed)]
+        return tasks
+
     def run(self) -> None:
         c = self.config
         # FCFS and the teacher on the eval seeds, once
@@ -766,7 +775,7 @@ class Trainer:
                           decoding="pl" if c.method == "pl" else "sample")
                      for l in c.loads for s in self.seeds(c.seeds_per_iteration)
                      for g in range(c.group_size)]
-            trajectories = self.pool.run(self.model.state_dict(), tasks)
+            trajectories = self.pool.run(self.model.state_dict(), self.attach_references(tasks))
             update = ppo_update_pl if c.method == "pl" else ppo_update
             stats = update(self.model, optimizer, trajectories, c, self.rng)
             serving = defaultdict(list)
