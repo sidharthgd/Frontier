@@ -200,7 +200,33 @@ _PREDICTION_FEATURE_DEFAULT_BOUNDS: Dict[str, Tuple[float | None, float | None]]
 }
 
 
+# Validated schemas by their names, for tuple and list schemas of exact
+# strings: every prediction validates the same few schemas.
+_PREDICTION_FEATURE_NAMES_MEMO: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
+
+
 def _as_prediction_feature_names(
+    model_name: str,
+    raw_feature_names: Any,
+) -> Tuple[str, ...]:
+    kind = type(raw_feature_names)
+    if kind is tuple or kind is list:
+        key = raw_feature_names if kind is tuple else tuple(raw_feature_names)
+        try:
+            cached = _PREDICTION_FEATURE_NAMES_MEMO.get(key)
+        except TypeError:  # unhashable names: validate them as before
+            cached = key = None
+        if cached is not None:
+            return cached
+    else:
+        key = None
+    feature_names = _validate_prediction_feature_names(model_name, raw_feature_names)
+    if key is not None and all(type(name) is str for name in key):
+        _PREDICTION_FEATURE_NAMES_MEMO[key] = feature_names
+    return feature_names
+
+
+def _validate_prediction_feature_names(
     model_name: str,
     raw_feature_names: Any,
 ) -> Tuple[str, ...]:
@@ -4485,27 +4511,27 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
         if model_info is None:
             raise ValueError(f"Model {model_name} not found in predictions")
 
-        if isinstance(model_info, Mapping) and model_info.get(
+        if (type(model_info) is dict or isinstance(model_info, Mapping)) and model_info.get(
             "_on_demand_prediction"
         ) is True:
-            if not isinstance(features, Mapping):
+            if not (type(features) is dict or isinstance(features, Mapping)):
                 raise ValueError(
                     f"Prediction features for {model_name} must be a mapping"
                 )
             return self._get_on_demand_prediction(model_name, dict(features))
 
-        if not isinstance(model_info, Mapping):
+        if not (type(model_info) is dict or isinstance(model_info, Mapping)):
             raise ValueError(
                 f"Prediction table for {model_name} must be a mapping"
             )
-        if not isinstance(features, Mapping):
+        if not (type(features) is dict or isinstance(features, Mapping)):
             raise ValueError(
                 f"Prediction features for {model_name} must be a mapping"
             )
 
         model = None
         models = getattr(self, "_models", None)
-        if isinstance(models, Mapping):
+        if (type(models) is dict or isinstance(models, Mapping)):
             model = models.get(model_name)
         if model is None:
             candidate = model_info.get("_model")
@@ -4573,7 +4599,7 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
         # exact metadata to the estimator.  Finite prediction tables remain
         # compatible with older artifacts that do not carry this optional map.
         exact_lookup = getattr(model, "_frontier_exact_lookup", None)
-        if exact_lookup is not None and not isinstance(exact_lookup, Mapping):
+        if exact_lookup is not None and not (type(exact_lookup) is dict or isinstance(exact_lookup, Mapping)):
             raise ValueError(
                 f"Prediction exact lookup metadata for {model_name} must be a mapping"
             )
@@ -4694,7 +4720,7 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
         if model_info is None:
             raise ValueError(f"Model {model_name} not found in predictions")
 
-        if not isinstance(model_info, Mapping) or model_info.get(
+        if not (type(model_info) is dict or isinstance(model_info, Mapping)) or model_info.get(
             "_on_demand_prediction"
         ) is not True:
             raise ValueError(
@@ -4729,7 +4755,7 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
                 f"record has {len(feature_names)} features, model has {model_feature_count}"
             )
 
-        if not isinstance(features, Mapping):
+        if not (type(features) is dict or isinstance(features, Mapping)):
             raise ValueError(
                 f"On-demand prediction features for {model_name} must be a mapping"
             )
@@ -4753,16 +4779,16 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
         domain = model_info.get("_feature_domain")
         if domain is None:
             domain = getattr(model, "_frontier_feature_domain", None)
-        if domain is not None and not isinstance(domain, Mapping):
+        if domain is not None and not (type(domain) is dict or isinstance(domain, Mapping)):
             raise ValueError(
                 f"On-demand prediction feature domain for {model_name} must be a mapping"
             )
 
         raw_bounds = model_info.get("_feature_bounds")
-        if raw_bounds is None and isinstance(domain, Mapping):
+        if raw_bounds is None and (type(domain) is dict or isinstance(domain, Mapping)):
             raw_bounds = domain.get("bounds", domain.get("physical_bounds"))
         if raw_bounds is not None:
-            if not isinstance(raw_bounds, Mapping):
+            if not (type(raw_bounds) is dict or isinstance(raw_bounds, Mapping)):
                 raise ValueError(
                     f"On-demand prediction feature bounds for {model_name} must be a mapping"
                 )
@@ -4796,7 +4822,7 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
                 )
 
         raw_constraints = model_info.get("_feature_constraints")
-        if raw_constraints is None and isinstance(domain, Mapping):
+        if raw_constraints is None and (type(domain) is dict or isinstance(domain, Mapping)):
             raw_constraints = domain.get("constraints")
         _validate_prediction_constraints(model_name, normalized_features, raw_constraints)
 
@@ -4804,7 +4830,7 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
         if declared_identity is None:
             declared_identity = model_info.get("_model_identity")
         if declared_identity is not None:
-            if not isinstance(declared_identity, Mapping):
+            if not (type(declared_identity) is dict or isinstance(declared_identity, Mapping)):
                 raise ValueError(f"On-demand prediction identity for {model_name} is invalid")
             runtime_identity = getattr(self, "_prediction_identity", None)
             if runtime_identity is None:
@@ -4834,7 +4860,7 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
                         if value is not None:
                             runtime_identity[identity_name] = value
                 runtime_identity["measurement_family"] = family_name
-            if not isinstance(runtime_identity, Mapping):
+            if not (type(runtime_identity) is dict or isinstance(runtime_identity, Mapping)):
                 raise ValueError(
                     f"On-demand prediction runtime identity for {model_name} is invalid"
                 )
@@ -4854,7 +4880,7 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
         exact_lookup = model_info.get("_exact_lookup", {})
         if exact_lookup is None:
             exact_lookup = {}
-        if not isinstance(exact_lookup, Mapping):
+        if not (type(exact_lookup) is dict or isinstance(exact_lookup, Mapping)):
             raise ValueError(
                 f"On-demand prediction exact lookup metadata for {model_name} is invalid"
             )
