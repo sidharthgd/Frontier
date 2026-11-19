@@ -257,6 +257,59 @@ def test_fast_stage_expansion_publishes_isolated_finalized_layers() -> None:
     assert first is not second
 
 
+@pytest.mark.parametrize("finalized", [False, True])
+@pytest.mark.parametrize("first_layer_id,layer_id_step", [(0, 1), (5, 3)])
+def test_direct_stage_expansion_matches_per_layer_copies(
+    monkeypatch, finalized: bool, first_layer_id: int, layer_id_step: int
+) -> None:
+    import frontier.entities.stage_execution_time as stage_module
+
+    source = _layer(
+        layer_id=0,
+        op_times={"attn_prefill": 4.0, "mlp_up_proj": 2.0},
+    )
+    if finalized:
+        source = source.finalized_copy()
+
+    def expand():
+        return StageExecutionTime.from_execution_time(
+            source,
+            num_layers=4,
+            first_layer_id=first_layer_id,
+            layer_id_step=layer_id_step,
+        )
+
+    assert stage_module._copies_by_dict(ExecutionTime)
+    direct = expand()
+    monkeypatch.setattr(stage_module, "_copies_by_dict", lambda cls: False)
+    general = expand()
+
+    assert type(direct) is type(general)
+    assert list(vars(direct)) == list(vars(general))
+    assert direct.stage_execution_time.__dict__ == general.stage_execution_time.__dict__
+    assert direct._model_time_ms_cache == general._model_time_ms_cache
+    assert direct.global_layer_ids == general.global_layer_ids
+    for a, b in zip(direct.layer_execution_times, general.layer_execution_times):
+        assert type(a) is type(b)
+        assert list(vars(a)) == list(vars(b))
+        for key, value in vars(a).items():
+            other = vars(b)[key]
+            if key.startswith("_") and key.endswith("_time") or key in ("_op_times", "_op_time_attr_values"):
+                # components are shared with each path's own finalized source
+                assert value is direct.stage_execution_time.__dict__[key]
+                assert other is general.stage_execution_time.__dict__[key]
+            else:
+                assert value == other, key
+    assert direct.model_time_ms == general.model_time_ms
+
+
+def test_direct_stage_expansion_checks_layer_identity() -> None:
+    source = _layer(layer_id=0)
+    source._attention_family_id = ""
+    with pytest.raises(ValueError, match="family_id"):
+        StageExecutionTime.from_execution_time(source, num_layers=2, first_layer_id=0)
+
+
 def test_single_layer_expansion_preserves_source_identity() -> None:
     source = _layer(layer_id=3)
 

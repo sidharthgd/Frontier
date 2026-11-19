@@ -92,6 +92,25 @@ _STAGE_ONLY_PUBLIC_NAMES = frozenset(
 )
 
 
+_PLAIN_COPY_CLASSES: dict[type, bool] = {}
+
+
+def _copies_by_dict(cls: type) -> bool:
+    """Whether copy.copy of a cls instance is cls.__new__(cls) plus a
+    __dict__ update: no copy or pickle hooks of its own, and no slots."""
+    plain = _PLAIN_COPY_CLASSES.get(cls)
+    if plain is None:
+        plain = _PLAIN_COPY_CLASSES[cls] = (
+            getattr(cls, "__copy__", None) is None
+            and cls.__reduce_ex__ is object.__reduce_ex__
+            and cls.__reduce__ is object.__reduce__
+            and cls.__getstate__ is object.__getstate__
+            and getattr(cls, "__setstate__", None) is None
+            and not any("__slots__" in vars(base) for base in cls.__mro__)
+            and "__dict__" in dir(cls)
+        )
+    return plain
+
 
 class StageExecutionTime:
     """Ordered real-layer timings plus stage-owned work.
@@ -153,22 +172,76 @@ class StageExecutionTime:
         if type(first_layer_id) is not int or first_layer_id < 0:
             raise ValueError("first_layer_id must be a non-negative int")
         source = source.finalized_copy()
-        layers = tuple(
-            source.as_single_layer(
-                global_layer_id=first_layer_id + offset * layer_id_step,
-                attention_family_id=source.attention_family_id,
-                attention_variant_id=source.attention_variant_id,
-                copy_components=False,
+        if cls is StageExecutionTime and _copies_by_dict(type(source)):
+            stage = cls._expand_finalized(
+                source,
+                num_layers=num_layers,
+                first_layer_id=first_layer_id,
+                layer_id_step=layer_id_step,
             )
-            for offset in range(num_layers)
-        )
-        stage = cls(layers, stage_execution_time=source)
+        else:
+            layers = tuple(
+                source.as_single_layer(
+                    global_layer_id=first_layer_id + offset * layer_id_step,
+                    attention_family_id=source.attention_family_id,
+                    attention_variant_id=source.attention_variant_id,
+                    copy_components=False,
+                )
+                for offset in range(num_layers)
+            )
+            stage = cls(layers, stage_execution_time=source)
         stage._model_time_ms_cache = (
             source.get_single_layer_block_time() * num_layers
             + stage._owner_value("pipeline_parallel_communication_time")
             + stage._owner_value("decode_draft_proposer_time")
             + stage._owner_value("mtp_terminal_overshoot_time")
         )
+        return stage
+
+    @classmethod
+    def _expand_finalized(
+        cls, source: ExecutionTime, *, num_layers: int, first_layer_id: int,
+        layer_id_step: int,
+    ) -> "StageExecutionTime":
+        """from_execution_time's layers and stage, built directly.
+
+        Gives what the general path gives (source.as_single_layer per layer,
+        then __init__) at a fraction of the cost, ~32 layers every step:
+
+        - as_single_layer(copy_components=False) on a finalized source is
+          copy.copy(source) with three identity fields replaced, and
+          copy.copy is cls.__new__(cls) plus a __dict__ update for the
+          plain classes the caller checks for (_copies_by_dict).
+        - Its LayerAttentionSpec check depends on the layer id only through
+          "non-negative int", which every id first_layer_id + k * step is
+          once the first one passes (from_execution_time checked both are
+          ints, first >= 0 and step > 0), so checking the first layer raises
+          exactly when the general path would.
+        - __init__'s checks hold by construction: a non-empty tuple of
+          ExecutionTime (type(source)) layers, already finalized (the copies
+          carry source's _finalized=True, so finalized_copy returns them),
+          with distinct, non-None ids (a strictly increasing progression).
+        """
+        from frontier.attention.gdn.config import LayerAttentionSpec
+
+        family_id = source.attention_family_id
+        variant_id = source.attention_variant_id
+        LayerAttentionSpec(first_layer_id, family_id, variant_id)
+        layer_cls = type(source)
+        state = source.__dict__
+        new = layer_cls.__new__
+        layers = []
+        for offset in range(num_layers):
+            layer = new(layer_cls)
+            layer.__dict__.update(state)
+            layer._global_layer_id = first_layer_id + offset * layer_id_step
+            layer._attention_family_id = family_id
+            layer._attention_variant_id = variant_id
+            layers.append(layer)
+        stage = cls.__new__(cls)
+        stage._layer_execution_times = tuple(layers)
+        stage._stage_execution_time = source
+        stage._model_time_ms_cache = None
         return stage
 
     @property
