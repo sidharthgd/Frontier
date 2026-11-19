@@ -222,6 +222,7 @@ def sample_concurrent_workload(
     min_turn_gap: float = 1.0,
     session_gap: float = 30.0,
     stagger: float = 60.0,
+    max_think_time: Optional[float] = None,
 ) -> pd.DataFrame:
     """A closed system of `concurrency` agents: each agent ("slot") runs
     whole sessions back to back, closed loop, starting the next session
@@ -236,7 +237,14 @@ def sample_concurrent_workload(
     calls until every slot has num_calls / concurrency (each slot is cut at
     twice that). Arrival times
     after a slot's first call only order its calls: consumers should
-    over-provision num_calls and score by simulated time."""
+    over-provision num_calls and score by simulated time.
+
+    max_think_time caps the think time between a session's calls (after
+    session_time_scale; None keeps the trace's). Traces have pauses of hours
+    or days inside a session; an agent stalled on one leaves the closed
+    system short an agent while the rest send calls that are simulated but
+    not scored, which made some episodes 10x slower. The cap keeps every
+    call and consumes no randomness, so the calls sampled are the same."""
     assert num_calls > 0 and concurrency > 0
     rng = np.random.default_rng(seed)
     frame = sessions.frame
@@ -269,6 +277,8 @@ def sample_concurrent_workload(
         thinks, numbers = [], []
         for k, rows in enumerate(chunks):
             think = gaps[rows] * session_time_scale
+            if max_think_time is not None:
+                think = np.minimum(think, max_think_time)
             think[0] = np.nan if k == 0 else rng.exponential(session_gap)
             thinks.append(think)
             numbers.append(np.full(len(rows), trace_session))
@@ -310,7 +320,7 @@ def sample_named_workload(
     concurrency = kwargs.pop("concurrency", None)
     if concurrency:
         concurrent_kwargs = {
-            k: v for k, v in kwargs.items() if k in ("session_time_scale", "turn_gap", "session_gap")
+            k: v for k, v in kwargs.items() if k in ("session_time_scale", "turn_gap", "session_gap", "max_think_time")
         }
     if not synthetic.is_synthetic(trace):
         sessions = load_session_trace(os.path.abspath(trace), max_tokens)

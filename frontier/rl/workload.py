@@ -117,6 +117,9 @@ class SessionTraceRequestGeneratorConfig:
     session_concurrency: int = 0
     # with session_concurrency: mean gap before an agent's next session
     session_gap: float = 30.0
+    # with session_concurrency: cap on the think time between a session's
+    # calls (sessions.sample_concurrent_workload; None = the trace's)
+    max_think_time: Optional[float] = None
 
 
 @dataclass
@@ -422,6 +425,7 @@ def _session_requests(config: SessionTraceRequestGeneratorConfig) -> List[Worklo
             session_time_scale=config.session_time_scale,
             turn_gap=config.turn_gap,
             session_gap=config.session_gap,
+            max_think_time=config.max_think_time,
         )
     else:
         workload = sessions.sample_named_workload(
@@ -526,6 +530,7 @@ def make_request_generator_config(
     session_warmup: float = 0.0,
     session_concurrency: int = 0,
     session_gap: float = 30.0,
+    max_think_time: Optional[float] = None,
 ):
     """
     The workload: request lengths from `trace_file` (a TRACE_FILES name or a
@@ -555,7 +560,9 @@ def make_request_generator_config(
             session_warmup=session_warmup,
             session_concurrency=session_concurrency,
             session_gap=session_gap,
+            max_think_time=max_think_time,
         )
+    assert max_think_time is None, "max_think_time needs arrivals=sessions"
     trace_file = _trace_file(trace_file)
     if arrivals == "trace":
         return TraceWindowRequestGeneratorConfig(
@@ -605,6 +612,7 @@ def make_simulation_config(
     session_warmup: float = 0.0,
     session_concurrency: int = 0,
     session_gap: float = 30.0,
+    max_think_time: Optional[float] = None,
 ) -> SimulationConfig:
     """
     Single-replica config with the workload from make_request_generator_config
@@ -645,6 +653,7 @@ def make_simulation_config(
             session_warmup=session_warmup,
             session_concurrency=session_concurrency,
             session_gap=session_gap,
+            max_think_time=max_think_time,
         ),
         metrics_config=MetricsConfig(output_dir=output_dir),
     )

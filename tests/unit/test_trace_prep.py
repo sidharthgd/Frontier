@@ -223,6 +223,24 @@ def test_sampler_gives_untimed_traces_think_time(tmp_path):
     assert gaps.min() >= 3.0 - 1e-9 and 10 < gaps.mean() < 35
 
 
+def test_concurrent_sampler_caps_think_time_without_changing_calls(tmp_path):
+    # every 5th gap is a 10,000 s pause inside the session
+    frame = _session_trace(100, calls=10, gap=10.0)
+    frame["arrived_at"] += 9_990.0 * (frame["step"] // 5)
+    path = tmp_path / "trace.csv"
+    frame.to_csv(path, index=False)
+    trace = sessions.load_session_trace(str(path))
+    plain = sessions.sample_concurrent_workload(trace, 200, concurrency=8, seed=3)
+    capped = sessions.sample_concurrent_workload(trace, 200, concurrency=8, seed=3, max_think_time=600.0)
+    assert plain["think_time"].max() == pytest.approx(10_000.0)
+    assert capped["think_time"].max() == pytest.approx(600.0)
+    # the same calls, only the long pauses shortened
+    pd.testing.assert_frame_equal(
+        plain.drop(columns="think_time"), capped.drop(columns="think_time")
+    )
+    pd.testing.assert_series_equal(capped["think_time"], plain["think_time"].clip(upper=600.0))
+
+
 def test_sampler_filters_long_calls_and_reports_exhaustion(tmp_path):
     path = tmp_path / "trace.csv"
     _session_trace(5, calls=20).to_csv(path, index=False)
