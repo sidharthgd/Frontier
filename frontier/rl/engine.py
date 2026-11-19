@@ -12,6 +12,7 @@ builds a WorkloadSpec per episode and runs it.
 - fast_forest: installed on import (FRONTIER_FAST_FOREST=0 turns it off).
 """
 
+import math
 import os
 import sys
 from contextlib import contextmanager
@@ -205,7 +206,7 @@ def _engine_key(spec: WorkloadSpec) -> Tuple:
     )
 
 
-def _round_bits(value: Any, bits: int) -> Any:
+def _round_bits_numpy(value: Any, bits: int) -> Any:
     if isinstance(value, bool) or not isinstance(value, (int, float, np.floating, np.integer)):
         return value
     value = float(value)
@@ -213,6 +214,30 @@ def _round_bits(value: Any, bits: int) -> Any:
         return value
     mantissa, exponent = np.frexp(value)
     return float(np.ldexp(np.round(mantissa * (1 << bits)) / (1 << bits), exponent))
+
+
+def _round_bits(value: Any, bits: int) -> Any:
+    """value to `bits` significant bits (round half to even), as a float.
+
+    Plain ints and floats take math.frexp/ldexp and round(), which give the
+    same floats as the numpy calls of _round_bits_numpy (mantissa * 2**bits
+    and the division are exact; round and np.round both round half to
+    even) at a fraction of the cost. Anything else, and the one case they
+    differ on (math.ldexp raises where np.ldexp overflows to inf), goes
+    through _round_bits_numpy.
+    """
+    kind = type(value)
+    if kind is float or kind is int:
+        value = float(value)
+        if value == 0.0 or not math.isfinite(value):
+            return value
+        mantissa, exponent = math.frexp(value)
+        scale = 1 << bits
+        try:
+            return math.ldexp(round(mantissa * scale) / scale, exponent)
+        except OverflowError:
+            pass
+    return _round_bits_numpy(value, bits)
 
 
 def _round_predictor_inputs(predictor: Any, bits: int) -> None:
