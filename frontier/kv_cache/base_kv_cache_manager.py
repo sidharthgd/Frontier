@@ -277,13 +277,18 @@ class KVCacheManager:
         ) + len(computed_blocks) * self.block_size
         num_full_blocks = (num_computed_tokens + num_tokens) // self.block_size
         num_cached_blocks = self.num_cached_blocks.get(request.id, len(computed_blocks))
-        new_bindings = self.block_pool.cache_full_blocks(
-            blocks=request_blocks,
-            block_hashes=request.bind_block_hash_ids(self.block_size),
-            num_cached_blocks=num_cached_blocks,
-            num_full_blocks=num_full_blocks,
-            creator_request_id=request.id,
-        )
+        if num_cached_blocks < num_full_blocks:
+            new_bindings = self.block_pool.cache_full_blocks(
+                blocks=request_blocks,
+                block_hashes=request.bind_block_hash_ids(self.block_size),
+                num_cached_blocks=num_cached_blocks,
+                num_full_blocks=num_full_blocks,
+                creator_request_id=request.id,
+            )
+        else:
+            # no block filled up (most decode steps): cache_full_blocks would
+            # return () without reading the hashes, which cost a list of them
+            new_bindings = ()
         self.num_cached_blocks[request.id] = num_full_blocks
         return KVCacheAllocationResult(
             reused_blocks=tuple(computed_blocks),
