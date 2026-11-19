@@ -3,6 +3,7 @@ import bisect
 import copy
 import hashlib
 import json
+import logging
 import os
 import pickle
 from abc import abstractmethod
@@ -6109,10 +6110,11 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
             raise ValueError(error_msg)
 
         # Log the valid prediction for debugging
-        logger.debug(
-            f"[EXEC_TIME_VALID] {operation_name}: {value:.6f}ms "
-            f"(batch_id={batch.id}, tokens={batch.num_tokens})"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"[EXEC_TIME_VALID] {operation_name}: {value:.6f}ms "
+                f"(batch_id={batch.id}, tokens={batch.num_tokens})"
+            )
 
         return value
 
@@ -7585,9 +7587,10 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
                 cluster_type=cluster_type,
             )
 
-        logger.debug(
-            f"Predicting attention layer time for layer_id={layer_id}, cluster_type={cluster_type}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Predicting attention layer time for layer_id={layer_id}, cluster_type={cluster_type}"
+            )
 
         # Get individual operation times for detailed tracing
         prefill_op_name = self._dense_attention_prefill_op_name()
@@ -7660,71 +7663,73 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
         # This enables comparison with real vLLM operation-level GPU execution traces
         # Refactored to use dynamic cluster_type.name instead of if/elif branching
         cluster_name = cluster_type.name
-        batch_input_lens = [req.num_prefill_tokens for req in batch.requests]
+        # the trace's f-strings are built only when it is logged
+        if logger.isEnabledFor(logging.INFO):
+            batch_input_lens = [req.num_prefill_tokens for req in batch.requests]
 
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
-            f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
-            f"batch_input_lens={batch_input_lens}, model_type=dense"
-        )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
+                f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
+                f"batch_input_lens={batch_input_lens}, model_type=dense"
+            )
 
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
-            f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
-            f"num_prefill_tokens={batch.num_prefill_tokens}, num_decode_tokens={batch.num_decode_tokens}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][input_layernorm] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_norm_time:.6f}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_pre_proj] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_pre_proj_time:.6f}"
-        )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_rope] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_rope_time:.6f}"
-        )
-        if batch.num_prefill_tokens > 0:
             logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][{prefill_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_prefill_time:.6f}"
-            )
-        if batch.num_decode_tokens > 0:
-            logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][{decode_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_decode_time:.6f}"
-            )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][{cache_write_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_kv_cache_save_time:.6f}"
-        )
-        if prices_kv_cache_extract:
-            logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][{DENSE_ATTENTION_KV_CACHE_EXTRACT.name}] "
-                f"batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_kv_cache_extract_time:.6f}"
+                f"[OP-TRACE][{cluster_name}][ATTENTION] batch_id={batch.id}, layer_id={layer_id}, "
+                f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
+                f"num_prefill_tokens={batch.num_prefill_tokens}, num_decode_tokens={batch.num_decode_tokens}"
             )
             logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][kv_send_slowdown] "
-                f"batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={kv_send_slowdown_time:.6f}"
+                f"[OP-TRACE][{cluster_name}][ATTENTION][input_layernorm] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_norm_time:.6f}"
             )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_post_proj] batch_id={batch.id}, layer_id={layer_id}, "
-            f"predicted_time_ms={attn_post_proj_time:.6f}"
-        )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_pre_proj] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_pre_proj_time:.6f}"
+            )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_rope] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_rope_time:.6f}"
+            )
+            if batch.num_prefill_tokens > 0:
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][{prefill_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_prefill_time:.6f}"
+                )
+            if batch.num_decode_tokens > 0:
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][{decode_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_decode_time:.6f}"
+                )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][{cache_write_op_name}] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_kv_cache_save_time:.6f}"
+            )
+            if prices_kv_cache_extract:
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][{DENSE_ATTENTION_KV_CACHE_EXTRACT.name}] "
+                    f"batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_kv_cache_extract_time:.6f}"
+                )
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][kv_send_slowdown] "
+                    f"batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={kv_send_slowdown_time:.6f}"
+                )
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_post_proj] batch_id={batch.id}, layer_id={layer_id}, "
+                f"predicted_time_ms={attn_post_proj_time:.6f}"
+            )
 
-        # Architecture-profile attention extra operation tracing.
-        if "attn_inter_norm" in self._get_predictor_attention_extra_ops():
-            logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_inter_norm] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_inter_norm_time:.6f}"
-            )
-            logger.info(
-                f"[OP-TRACE][{cluster_name}][ATTENTION][attn_wq_proj] batch_id={batch.id}, layer_id={layer_id}, "
-                f"predicted_time_ms={attn_wq_proj_time:.6f}"
-            )
+            # Architecture-profile attention extra operation tracing.
+            if "attn_inter_norm" in self._get_predictor_attention_extra_ops():
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][attn_inter_norm] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_inter_norm_time:.6f}"
+                )
+                logger.info(
+                    f"[OP-TRACE][{cluster_name}][ATTENTION][attn_wq_proj] batch_id={batch.id}, layer_id={layer_id}, "
+                    f"predicted_time_ms={attn_wq_proj_time:.6f}"
+                )
 
         total_attention_time = (
             attn_norm_time
@@ -7740,10 +7745,11 @@ class SklearnExecutionTimePredictor(KernelCountTraining, KernelGapPricing, BaseE
             + attn_inter_norm_time
             + attn_wq_proj_time
         )
-        logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
-            f"total_attention_time_ms={total_attention_time:.6f}"
-        )
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                f"[OP-TRACE][{cluster_name}][ATTENTION][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
+                f"total_attention_time_ms={total_attention_time:.6f}"
+            )
 
         return AttentionTime(
             attention_prefill_execution_time=attn_prefill_time,
