@@ -167,11 +167,26 @@ class KVCacheManager:
 
         block_hashes = request.lookup_block_hash_ids(self.block_size)
         computed_blocks: list[KVCacheBlock] = []
-        for block_hash in block_hashes:
-            cached_block = self.block_pool.get_cached_block(block_hash)
-            if cached_block is None:
-                break
-            computed_blocks.append(cached_block)
+        if type(self.block_pool).get_cached_block is BlockPool.get_cached_block:
+            # BlockPool.get_cached_block inlined: an agentic prompt is ~8k
+            # blocks, and a waiting request is looked up every step
+            cached_index = self.block_pool.cached_block_hash_to_block
+            append = computed_blocks.append
+            for block_hash in block_hashes:
+                cached = cached_index.get(block_hash)
+                if not cached:
+                    break
+                if len(cached) == 1:
+                    (block,) = cached.values()
+                    append(block)
+                else:
+                    append(cached[min(cached)])
+        else:
+            for block_hash in block_hashes:
+                cached_block = self.block_pool.get_cached_block(block_hash)
+                if cached_block is None:
+                    break
+                computed_blocks.append(cached_block)
 
         self.prefix_cache_stats.requests += 1
         self.prefix_cache_stats.queries += len(block_hashes)

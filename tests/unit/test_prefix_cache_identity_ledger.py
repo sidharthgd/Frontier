@@ -233,3 +233,33 @@ def test_blocks_past_the_prompt_keep_no_trace_hash() -> None:
     assert [block.block_hash for block in admission.raw_hit_blocks] == [11]
     assert admission.effective_cached_tokens == 2
     assert admission.num_new_tokens == 4
+
+
+def test_hit_binding_fast_check_agrees_with_the_checked_loop() -> None:
+    from frontier.kv_cache.kv_cache_block import KVCacheBlock
+    from frontier.scheduler.replica_scheduler.vllm_v1_prefix_cache import (
+        _checked_hit_bindings,
+        _consistent_hit_bindings,
+    )
+
+    def bound(block_id, block_hash):
+        block = KVCacheBlock(block_id)
+        block.bind(block_hash, creator_request_id=1)
+        return block
+
+    blocks = [bound(i, h) for i, h in enumerate([11, 22, 33])]
+    for queries in ([11, 22, 33], [11, 22, 33, 44]):
+        fast = _consistent_hit_bindings(blocks, queries)
+        assert fast == _checked_hit_bindings(blocks, queries)
+        assert [b.block_hash for b in fast] == [11, 22, 33]
+    assert _consistent_hit_bindings([], []) == []
+
+    cases = [
+        (blocks, [11, 99, 33], "disagrees"),  # wrong hash
+        (blocks, [11, 22], None),  # more hits than queries: IndexError
+        (blocks[:1] + [KVCacheBlock(7)] + blocks[1:], [11, 22, 33, 44], "no binding"),
+    ]
+    for hit, queries, message in cases:
+        assert _consistent_hit_bindings(hit, queries) is None
+        with pytest.raises(IndexError if message is None else ValueError, match=message):
+            _checked_hit_bindings(hit, queries)

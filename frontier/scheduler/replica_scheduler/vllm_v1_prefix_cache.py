@@ -39,6 +39,49 @@ def _serialize_prefix_cache_binding(
     }
 
 
+def _checked_hit_bindings(
+    hit_blocks: Sequence[KVCacheBlock], query_hashes: Sequence[Any]
+) -> list[KVCacheBlockBinding]:
+    """The bindings of a prefix-cache hit, in order, after checking each
+    is bound to its query's hash; raises at the first block that is not."""
+    raw_hit_bindings: list[KVCacheBlockBinding] = []
+    for query_index, block in enumerate(hit_blocks):
+        binding = block.binding
+        if binding is None:
+            raise ValueError(
+                f"Prefix cache hit block {block.block_id} has no binding identity."
+            )
+        if binding.block_hash != query_hashes[query_index]:
+            raise ValueError(
+                "Prefix cache hit binding disagrees with ordered query hash: "
+                f"query_index={query_index}, "
+                f"query_hash={query_hashes[query_index]!r}, "
+                f"binding_hash={binding.block_hash!r}"
+            )
+        raw_hit_bindings.append(binding)
+    return raw_hit_bindings
+
+
+def _consistent_hit_bindings(
+    hit_blocks: Sequence[KVCacheBlock], query_hashes: list
+) -> Optional[list[KVCacheBlockBinding]]:
+    """_checked_hit_bindings for a hit that passes its checks, in two list
+    comprehensions and one list comparison instead of a loop (a hit can be
+    ~8k blocks, checked every step a request waits); None when any check
+    might fail, for _checked_hit_bindings to raise its error.
+
+    Equivalent for the int hashes of query lists (Request.lookup_block_hash_ids):
+    the list comparison is element-wise ==, the negation of the loop's !=."""
+    try:
+        bindings = [block.binding for block in hit_blocks]
+        hashes = [binding.block_hash for binding in bindings]
+    except (AttributeError, ValueError):  # an unbound block, or bad identity
+        return None
+    if hashes != query_hashes[: len(hashes)] or len(hashes) > len(query_hashes):
+        return None
+    return bindings
+
+
 class PrefixCacheLedger:
     """Prefix-cache admission and identity-event emission."""
 
@@ -82,22 +125,10 @@ class PrefixCacheLedger:
             request
         )
         raw_hit_blocks = tuple(computed_blocks)
-        raw_hit_bindings: list[KVCacheBlockBinding] = []
         query_hashes = request.lookup_block_hash_ids(int(self._config.block_size))
-        for query_index, block in enumerate(raw_hit_blocks):
-            binding = block.binding
-            if binding is None:
-                raise ValueError(
-                    f"Prefix cache hit block {block.block_id} has no binding identity."
-                )
-            if binding.block_hash != query_hashes[query_index]:
-                raise ValueError(
-                    "Prefix cache hit binding disagrees with ordered query hash: "
-                    f"query_index={query_index}, "
-                    f"query_hash={query_hashes[query_index]!r}, "
-                    f"binding_hash={binding.block_hash!r}"
-                )
-            raw_hit_bindings.append(binding)
+        raw_hit_bindings = _consistent_hit_bindings(raw_hit_blocks, query_hashes)
+        if raw_hit_bindings is None:
+            raw_hit_bindings = _checked_hit_bindings(raw_hit_blocks, query_hashes)
         raw_cached_tokens = int(num_computed_tokens)
         schedule_target_tokens = int(
             request.num_processed_tokens
