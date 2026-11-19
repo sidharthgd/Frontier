@@ -99,6 +99,38 @@ def prefix_cache_view(scheduler, request: Request) -> Tuple[int, int, int]:
     return (*manager.peek_prefix_cache(request), -1)
 
 
+# --- SJF job sizes, shared by both RL stacks' baselines ------------------------
+
+
+def prefill_target_tokens(request: Request) -> int:
+    """Tokens a waiting request must have computed before it decodes again:
+    its prompt, or for a victim preempted after prefill its prompt plus the
+    output it kept (vLLM v1 recomputes both; prefix_cache_view looks up the
+    same span)."""
+    if request.is_recomputing:
+        return int(request.num_processed_tokens)
+    return int(request.num_prefill_tokens)
+
+
+def prefill_work_tokens(request: Request, cached_tokens: int) -> int:
+    """The prefill a waiting request needs: prefill_target_tokens less what
+    the prefix cache holds for it (cached_tokens, prefix_cache_view's first
+    entry). A real server knows it (vLLM: request.num_tokens less its
+    prefix-cache hit), so it is no oracle."""
+    return max(prefill_target_tokens(request) - int(cached_tokens), 0)
+
+
+def job_size_tokens(request: Request, cached_tokens: int, with_output: bool) -> int:
+    """SJF job size: prefill_work_tokens, plus, with_output (an oracle), the
+    output tokens still to generate. prefill-only SJF (no oracle) and total
+    SJF in frontier/rl/agents.py and frontier/rl/sched (via
+    sched/frontier_env.py's _OracleRequest) rank by these."""
+    size = prefill_work_tokens(request, cached_tokens)
+    if with_output:
+        size += int(request.remaining_decode_tokens)
+    return size
+
+
 def build_observation(
     time: float,
     waiting: List[Request],

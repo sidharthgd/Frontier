@@ -276,7 +276,7 @@ def test_sjf_sizes_jobs_by_uncached_prompt_tokens():
     assert obs.waiting_feature("cached_prompt_tokens").tolist() == [0, 60 * 16]
 
     oracle, _ = OracleSJFAgent().act_oracle(obs, waiting, scheduler)
-    prompt, _ = PromptSJFAgent().act(obs)
+    prompt, _ = PromptSJFAgent().act_oracle(obs, waiting, scheduler)
     assert list(oracle) == [1, 0] and list(prompt) == [1, 0]  # cached long call first
 
 

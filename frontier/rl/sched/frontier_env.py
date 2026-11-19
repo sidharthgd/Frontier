@@ -14,7 +14,8 @@ built the way the stack's Vidur version built it:
 - Observations are the frontier/rl/sched/features.py features, computed from Frontier's
   scheduler state; FrontierFeatureScheduler keeps the request histories and
   sliding windows that RLVLLMReplicaScheduler keeps.
-- As in frontier/rl/sched/env.py, the policy ranks only when at least 2 requests wait,
+- Every waiting queue is ranked, but only rankings of at least 2 requests are
+  RL decisions (frontier/rl/scheduler.py MIN_WAITING_TO_RECORD),
   a ranking that admitted nothing is undone and dropped, and each kept ranking
   gets admission action bounds.
 - Rewards are computed after the episode from request and token timings with
@@ -84,9 +85,10 @@ from frontier.rl.env import (
     _working_dir,
 )
 from frontier.rl.env import make_simulation_config as frontier_config
-from frontier.rl.observation import prefix_cache_view
+from frontier.rl.observation import prefill_target_tokens, prefix_cache_view
 from frontier.rl.scoring import ScoreWindow
 from frontier.rl.scheduler import (
+    MIN_WAITING_TO_RECORD,
     PriorityPolicy,
     RLVLLMv1EngineReplicaScheduler,
     replica_schedulers,
@@ -262,12 +264,18 @@ def _view(
 
 
 class _OracleRequest:
-    """A waiting Frontier request as oracle baselines see it, plus the prompt
-    tokens Frontier's prefix cache holds for it now (job_size subtracts them)."""
+    """A waiting Frontier request as the SJF baselines (history.job_size) see
+    it, in the terms of the size both RL stacks share
+    (frontier/rl/observation.py job_size_tokens): num_prefill_tokens is what
+    admission must compute (for a victim preempted after prefill, prompt plus
+    kept output), num_cached_prefill_tokens what the prefix cache holds of it
+    now, num_decode_tokens the output still to generate."""
 
     def __init__(self, request: FrontierRequest, num_cached_prefill_tokens: int) -> None:
         self._request = request
         self.num_cached_prefill_tokens = int(num_cached_prefill_tokens)
+        self.num_prefill_tokens = prefill_target_tokens(request)
+        self.num_decode_tokens = int(request.remaining_decode_tokens)
 
     def __getattr__(self, name: str):
         return getattr(self._request, name)
@@ -353,9 +361,11 @@ class _BridgePolicy(PriorityPolicy):
         if self.score_window is not None:
             for r in waiting:
                 self.score_window.saw(r)
-        # Vidur ranks only when there is something to reorder
-        if len(waiting) < 2:
+        # a lone request is ranked too, but is no RL decision
+        # (frontier/rl/scheduler.py MIN_WAITING_TO_RECORD)
+        if not waiting:
             return None
+        record = len(waiting) >= MIN_WAITING_TO_RECORD
         rank_mask = [True] * len(waiting)
         view = _SchedulerView(scheduler, self._num_levels, self.first_token_at, rank_mask)
         # one prefix-cache lookup per request, shared by features and oracles
@@ -387,21 +397,26 @@ class _BridgePolicy(PriorityPolicy):
             [(r.arrived_at, r.id) for r in waiting],
             [(r, r.priority) for r in waiting],
             scheduler,
+            record,
         )
         return action
 
     def on_admission(self, admitted, boundary):
         if self._pending is None:
             return
-        obs, action, info, arrival_keys, previous, scheduler = self._pending
+        obs, action, info, arrival_keys, previous, scheduler, record = self._pending
         self._pending = None
         ranked = scheduler._ranked_waiting
-        self._update_history(scheduler, ranked, admitted)
+        if record:
+            self._update_history(scheduler, ranked, admitted)
 
         if not admitted:
             # no effect on this batch: undo it, so it has none on preemption
             for request, priority in previous:
                 request.set_priority(priority)
+            return
+        if not record:
+            # a lone request keeps its priority (preemption order), no transition
             return
 
         admitted_ids = {r.id for r in admitted}

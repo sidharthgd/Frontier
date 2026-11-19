@@ -46,18 +46,13 @@ workloads:
     session_warmup: 600
   backend: frontier
   frontier: &frontier
-    model: llama3.1-8b
-    device: a100
-    network_device: a100_dgx
-    # the A100 profile has no CPU-overhead tables
-    model_cpu_overhead: false
+    # A100 + Llama-3.1-8B as validated against vLLM (frontier/rl/env.py
+    # a100_llama31_8b, also FrontierSchedulingEnv's): piecewise CUDA graphs,
+    # 128k context, no CPU-overhead tables. Runs before 2026-11-19
+    # (rl_runs/frontier_concurrency{,_ppo}) had decode CUDA graphs off.
+    preset: a100_llama31_8b
     prediction_rounding_bits: 5
     enable_prefix_caching: true
-    extra_args:
-    - --vllm_v1_scheduler_config_max_model_len
-    - '131072'
-    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
-    - '256'
 eval_workloads:
 - name: tracelab_c12
   trace: tracelab

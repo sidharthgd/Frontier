@@ -33,7 +33,9 @@ from frontier.rl import fast_forest
 from frontier.rl.observation import Observation, build_observation
 from frontier.rl.reward import RewardConfig, transition_components
 from frontier.simulator import Simulator
+from frontier.rl.scoring import ScoreWindow
 from frontier.rl.scheduler import (
+    MIN_WAITING_TO_RECORD,
     PriorityPolicy,
     RLVLLMv1EngineReplicaScheduler,
     replica_schedulers,
@@ -75,6 +77,16 @@ class WorkloadSpec:
     session_phase: str = "stationary"
     # a session's next call waits for its previous one (sessions.py)
     session_closed_loop: bool = True
+    # seconds of warm-up calls before the num_requests scored ones: simulated,
+    # not scored (frontier/rl/scoring.py)
+    session_warmup: float = 0.0
+    # > 0: a closed system of this many agents running sessions back to back
+    # (sessions.sample_concurrent_workload) instead of a qps window; each
+    # agent's first ceil(num_requests / agents) calls after session_warmup
+    # are scored and the episode stops once they finish (scoring.ScoreWindow)
+    session_concurrency: int = 0
+    # with session_concurrency: mean gap before an agent's next session
+    session_gap: float = 30.0
     max_tokens: int = 4096
     # hardware and engine
     model: str = "llama2_7b_dense_example"
@@ -250,29 +262,85 @@ def session_workload_trace(spec: WorkloadSpec, seed: int, output_dir: str) -> st
     import hashlib
 
     from frontier.trace_prep import synthetic
-    from frontier.trace_prep.sessions import sample_named_workload, write_session_workload
+    from frontier.rl.scoring import CONCURRENT_OVERPROVISION
+    from frontier.trace_prep.sessions import sample_named_workload
 
     assert spec.session_trace, "arrivals=sessions needs session_trace"
     trace = spec.session_trace if synthetic.is_synthetic(spec.session_trace) else os.path.abspath(spec.session_trace)
     params = (
         trace, spec.num_requests, spec.qps, seed, spec.max_tokens,
         spec.session_time_scale, spec.turn_gap, spec.session_phase,
-        spec.session_closed_loop,
+        spec.session_closed_loop, spec.session_warmup, spec.session_concurrency,
+        spec.session_gap,
     )
+    # a rebuilt trace file must not reuse workloads sampled from the old one
+    source = os.path.join(FRONTIER_ROOT, "frontier", "trace_prep", "synthetic.py") if synthetic.is_synthetic(trace) else trace
+    if os.path.exists(source):
+        stat = os.stat(source)
+        params += (stat.st_size, stat.st_mtime_ns)
     key = hashlib.sha1(repr(params).encode()).hexdigest()[:16]
     directory = os.path.join(os.path.abspath(output_dir), "session_workloads")
     path = os.path.join(directory, f"{key}.csv")
     if not os.path.exists(path):
         os.makedirs(directory, exist_ok=True)
-        workload = sample_named_workload(
-            trace, spec.num_requests, spec.qps, seed, spec.max_tokens,
-            session_time_scale=spec.session_time_scale,
-            turn_gap=spec.turn_gap,
-            phase=spec.session_phase,
-            closed_loop=spec.session_closed_loop,
-        )
-        write_session_workload(path, workload)
+        if spec.session_concurrency:
+            # closed system: over-provisioned calls; the score window takes
+            # each agent's quota after the warm-up and stops there
+            workload = sample_named_workload(
+                trace, CONCURRENT_OVERPROVISION * spec.num_requests, spec.qps, seed,
+                spec.max_tokens,
+                concurrency=spec.session_concurrency,
+                session_time_scale=spec.session_time_scale,
+                turn_gap=spec.turn_gap,
+                session_gap=spec.session_gap,
+            )
+        else:
+            workload = sample_named_workload(
+                trace, spec.num_requests, spec.qps, seed, spec.max_tokens,
+                session_time_scale=spec.session_time_scale,
+                turn_gap=spec.turn_gap,
+                phase=spec.session_phase,
+                closed_loop=spec.session_closed_loop,
+                **({"warmup": spec.session_warmup} if spec.session_warmup else {}),
+            )
+        write_replay_trace(path, workload)
     return path
+
+
+# columns of a replayed session workload, as both RL stacks write them
+REPLAY_COLUMNS = (
+    "arrived_at", "num_prefill_tokens", "num_decode_tokens",
+    "session_id", "block_hash_ids", "think_time", "ids_cover_output", "warmup",
+)
+
+
+def write_replay_trace(path: str, workload) -> None:
+    """A sampled session workload (frontier/trace_prep/sessions.py) as the CSV
+    Frontier replays, written as frontier/rl/sched's FrontierEnv.workload_trace
+    writes it (same columns, types and float precision, rows in arrival
+    order), so both RL stacks replay identical workloads."""
+    import pandas as pd
+
+    columns = {
+        "arrived_at": workload["arrived_at"].astype(float),
+        "num_prefill_tokens": workload["num_prefill_tokens"].astype(int),
+        "num_decode_tokens": workload["num_decode_tokens"].astype(int),
+        "session_id": workload["session_id"].astype(int),
+        "block_hash_ids": workload["block_hash_ids"].astype(str),
+        "ids_cover_output": (
+            workload["ids_cover_output"].fillna(0).astype(int)
+            if "ids_cover_output" in workload else 0
+        ),
+        "think_time": (
+            workload["think_time"].astype(float) if "think_time" in workload else float("nan")
+        ),
+        "warmup": workload["warmup"].fillna(0).astype(int) if "warmup" in workload else 0,
+    }
+    frame = pd.DataFrame({name: columns[name] for name in REPLAY_COLUMNS})
+    frame = frame.reset_index(drop=True).sort_values("arrived_at", kind="stable")
+    temporary = f"{path}.{os.getpid()}.tmp"
+    frame.to_csv(temporary, index=False)
+    os.replace(temporary, path)
 
 
 def make_simulation_config(
@@ -310,7 +378,7 @@ _WORKLOAD_FIELDS = {
     "name", "num_requests", "qps", "arrivals", "cv", "length_trace",
     "prefill_tokens", "decode_tokens", "replay_trace", "replay_time_scale",
     "session_trace", "session_time_scale", "turn_gap", "session_phase",
-    "session_closed_loop",
+    "session_closed_loop", "session_warmup", "session_concurrency", "session_gap",
 }
 
 
@@ -462,6 +530,9 @@ class AgentPriorityPolicy(PriorityPolicy):
         self.transitions: List[Transition] = []
         self.num_dropped = 0
         self.records: Dict[int, RequestRecord] = {}
+        # session_concurrency: the calls the episode scores (frontier/rl/scoring.py)
+        self.score_window: Optional[ScoreWindow] = None
+        self._completed: set = set()
 
     def _record(self, request: Request) -> RequestRecord:
         record = self.records.get(request.id)
@@ -479,6 +550,8 @@ class AgentPriorityPolicy(PriorityPolicy):
     def get_priorities(self, waiting, scheduler):
         for request in waiting:
             self._record(request)
+            if self.score_window is not None:
+                self.score_window.saw(request)
         if not waiting:
             return None
         time = float(self._clock())
@@ -495,19 +568,25 @@ class AgentPriorityPolicy(PriorityPolicy):
             )
         previous = [r.priority for r in waiting]
         transition = Transition(time, obs, priorities, info, [], None)
-        self._pending = (transition, list(waiting), previous)
+        # a lone request is ranked (its priority orders preemption) but is no
+        # decision (frontier/rl/scheduler.py MIN_WAITING_TO_RECORD)
+        record = len(waiting) >= MIN_WAITING_TO_RECORD
+        self._pending = (transition, list(waiting), previous, record)
         return priorities
 
     def on_admission(self, admitted, boundary):
         if self._pending is None:
             return
-        transition, waiting, previous = self._pending
+        transition, waiting, previous, record = self._pending
         self._pending = None
         if not admitted:
             # no effect on admission: undo, so it has no effect on preemption
             for request, priority in zip(waiting, previous):
                 request.set_priority(priority)
-            self.num_dropped += 1
+            if record:
+                self.num_dropped += 1
+            return
+        if not record:
             return
         transition.admitted_ids = [r.id for r in admitted]
         transition.boundary_id = boundary.id if boundary is not None else None
@@ -515,8 +594,11 @@ class AgentPriorityPolicy(PriorityPolicy):
 
     def on_batch_end(self, batch: Batch) -> None:
         time = float(batch.completed_at)
+        finished = False
         for request in batch.requests:
             record = self._record(request)
+            if self.score_window is not None:
+                self.score_window.saw(request)
             if request.is_prefill_complete:
                 record.token_times.append(time)
                 if record.first_token_at is None:
@@ -525,6 +607,10 @@ class AgentPriorityPolicy(PriorityPolicy):
                 record.completed_at = float(request.completed_at)
                 record.num_preemptions = int(request.get_total_preemption_count())
                 record.num_cached_prefill_tokens = int(request.num_prefill_tokens_cached)
+                self._completed.add(request.id)
+                finished = True
+        if finished and self.score_window is not None:
+            self.score_window.maybe_stop(self._completed)
 
 
 class FrontierSchedulingEnv:
@@ -569,7 +655,27 @@ class FrontierSchedulingEnv:
         return simulator
 
     def run_episode(self, agent: BaseAgent, seed: int = 0) -> Episode:
+        """
+        One episode. Session workloads score as frontier/rl/sched's FrontierEnv
+        does: with session_concurrency, each agent's quota after the warm-up
+        (scoring.ScoreWindow, the simulation stops once they finish);
+        otherwise every call but session_warmup's warm-up calls. Unscored calls
+        are simulated (they keep the server loaded and its cache warm) but left
+        out of requests, rewards and the summary, as are decisions before the
+        first scored call arrives.
+        """
+        import pandas as pd
+
+        frame = None
+        if self.spec.arrivals == "sessions":
+            frame = pd.read_csv(
+                session_workload_trace(self.spec, seed, self._output_dir),
+                usecols=lambda c: c in ("session_id", "warmup"),
+            )
         with _working_dir(FRONTIER_ROOT):
+            # request ids are trace rows, as in frontier/rl/sched, so calls
+            # match across episodes and stacks
+            Request._id = -1
             simulator = self.make_simulator(seed)
             policy = AgentPriorityPolicy(
                 agent, self.num_priority_levels, clock=lambda: simulator._time
@@ -577,14 +683,34 @@ class FrontierSchedulingEnv:
             schedulers = replica_schedulers(simulator)
             assert len(schedulers) == 1, "the env drives a single replica"
             schedulers[0].set_priority_policy(policy)
+            if self.spec.session_concurrency:
+                # agents = slots actually sampled (synthetic scales the count)
+                policy.score_window = ScoreWindow.for_workload(
+                    simulator,
+                    self.spec.session_warmup,
+                    self.spec.num_requests,
+                    int(frame["session_id"].nunique()),
+                )
             simulator.run()
         self.last_simulator = simulator
 
         requests = sorted(policy.records.values(), key=lambda r: r.id)
+        transitions = policy.transitions
+        scored = None
+        if policy.score_window is not None:
+            scored = policy.score_window.final_ids()
+        elif frame is not None and "warmup" in frame and frame["warmup"].any():
+            warmup = set(np.flatnonzero(frame["warmup"].to_numpy() > 0).tolist())
+            scored = {r.id for r in requests} - warmup
+        if scored is not None:
+            assert scored, "every call is warm-up"
+            requests = [r for r in requests if r.id in scored]
+            start = min(r.arrived_at for r in requests)
+            transitions = [t for t in transitions if t.time >= start]
         episode = Episode(
             workload=self.spec.name,
             seed=seed,
-            transitions=policy.transitions,
+            transitions=transitions,
             requests=requests,
             end_time=float(simulator._time),
             num_dropped_decisions=policy.num_dropped,

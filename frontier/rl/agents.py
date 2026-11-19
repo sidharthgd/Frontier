@@ -1,15 +1,18 @@
 """
-Baseline agents, by name (as in vidur/rl/agents.py):
+Baseline agents, by name (as in frontier/rl/sched/agents.py):
 
     fcfs                        every request priority 0: (arrival, id) order
     random                      uniform priorities
-    sjf_prefill[_age<r>]        shortest prompt first; aging subtracts r tokens per
-                                second waited. Needs no oracle.
-    sjf_total[_age<r>]          oracle: prompt + true output length
+    sjf_prefill[_age<r>]        least prefill work first; aging subtracts r tokens
+                                per second waited. Needs no oracle.
+    sjf_total[_age<r>]          oracle: prefill work + output still to generate
 
-With prefix caching, both count only the prompt tokens the cache does not
-hold at ranking time (the prompt work admission would actually do): a 120k
-call whose first 119k tokens are cached is a 1k-token job.
+Prefill work is observation.prefill_work_tokens, the size the training
+stack's SJF baselines (frontier/rl/sched: sjf_prefill_tokens,
+sjf_total_tokens) use too: the prompt (for a victim preempted after prefill,
+the prompt plus the output it kept, which vLLM recomputes) less what the
+prefix cache holds at ranking time. A 120k call whose first 119k tokens are
+cached is a 1k-token job.
 """
 
 import re
@@ -18,7 +21,7 @@ from typing import Optional
 import numpy as np
 
 from frontier.rl.env import BaseAgent, OracleAgent
-from frontier.rl.observation import Observation, cached_prefix_tokens
+from frontier.rl.observation import Observation, cached_prefix_tokens, job_size_tokens
 
 
 class FCFSAgent(BaseAgent):
@@ -42,23 +45,13 @@ def _ranks(sizes: np.ndarray, obs: Observation) -> np.ndarray:
     return ranks
 
 
-class PromptSJFAgent(BaseAgent):
+class _SJFAgent(OracleAgent):
+    """SJF by job_size_tokens with aging. It reads the waiting requests (a
+    victim's recompute length, the cache lookup), hence an OracleAgent, but
+    only with_output reads the true output length."""
+
     unbounded_priorities = True
-
-    def __init__(self, aging: float = 0.0) -> None:
-        self._aging = aging
-
-    def act(self, obs: Observation):
-        sizes = obs.waiting_feature("prompt_tokens") - np.maximum(
-            obs.waiting_feature("processed_tokens"),
-            obs.waiting_feature("cached_prompt_tokens"),
-        )
-        sizes = sizes - self._aging * obs.waiting_feature("wait_time")
-        return _ranks(sizes, obs), {}
-
-
-class OracleSJFAgent(OracleAgent):
-    unbounded_priorities = True
+    with_output = False
 
     def __init__(self, aging: float = 0.0) -> None:
         self._aging = aging
@@ -66,13 +59,23 @@ class OracleSJFAgent(OracleAgent):
     def act_oracle(self, obs, waiting, scheduler):
         sizes = np.array(
             [
-                r.num_prefill_tokens - cached_prefix_tokens(scheduler, r) + r.num_decode_tokens
+                job_size_tokens(r, cached_prefix_tokens(scheduler, r), self.with_output)
                 for r in waiting
             ],
             dtype=float,
         )
         sizes -= self._aging * (obs.time - obs.arrival_times)
         return _ranks(sizes, obs), {}
+
+
+class PromptSJFAgent(_SJFAgent):
+    """Least prefill work first (no oracle)."""
+
+
+class OracleSJFAgent(_SJFAgent):
+    """Least prefill work plus remaining output first (oracle)."""
+
+    with_output = True
 
 
 _SJF = re.compile(r"^sjf_(?P<key>prefill|total)(?:_age(?P<age>[0-9.]+))?$")

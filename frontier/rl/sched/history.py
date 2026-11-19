@@ -90,30 +90,32 @@ def job_size(request, key: str, max_num_batched_tokens: int) -> int:
     Remaining work of a waiting request, using its true output length (an
     oracle; the RL observation never exposes it), except for prefill_tokens.
 
-      total_tokens   prefill + decode tokens
+      total_tokens   prefill work + output tokens still to generate
       decode_tokens  output tokens still to generate
       iterations     scheduler iterations it needs on its own: chunked prefill
                      iterations plus one per output token
-      prefill_tokens prompt tokens still to compute (no oracle: a server knows
-                     them), i.e. uncached-prompt SJF with a prefix cache
+      prefill_tokens prefill work (no oracle: a server knows it), i.e.
+                     uncached-prompt SJF with a prefix cache
 
-    A preempted request restarts with its generated tokens folded into the
-    prompt, so these stay the remaining work after a restart.
-
-    Prompt tokens a prefix cache already holds (num_cached_prefill_tokens, set
-    by frontier/rl/sched/frontier_env.py for Frontier's cache; 0 for Vidur requests)
-    are not work: a 120k prompt with 119k cached is a 1k-token prefill.
+    Prefill work is num_prefill_tokens less num_cached_prefill_tokens. On
+    Frontier, frontier_env._OracleRequest gives a request in the terms of
+    frontier/rl/observation.py's job_size_tokens, the size
+    FrontierSchedulingEnv's SJF baselines use too: num_prefill_tokens is what
+    admission must compute (a victim preempted after prefill recomputes its
+    prompt and kept output), num_cached_prefill_tokens what the prefix cache
+    holds of it, num_decode_tokens the output still to generate. A 120k prompt
+    with 119k cached is a 1k-token prefill.
     """
-    prefill = request.num_prefill_tokens - getattr(request, "num_cached_prefill_tokens", 0)
+    prefill = max(
+        request.num_prefill_tokens - getattr(request, "num_cached_prefill_tokens", 0), 0
+    )
     if key == "total_tokens":
         return prefill + request.num_decode_tokens
     if key == "decode_tokens":
         return request.num_decode_tokens
     if key == "prefill_tokens":
-        return max(prefill, 0)
+        return prefill
     if key == "iterations":
         prefill_iterations = -(-prefill // max_num_batched_tokens)
         return prefill_iterations + request.num_decode_tokens
-    if key == "prefill_tokens":
-        return request.num_prefill_tokens
     raise ValueError(f"Unknown job size key {key}. Valid keys: {JOB_SIZE_KEYS}")

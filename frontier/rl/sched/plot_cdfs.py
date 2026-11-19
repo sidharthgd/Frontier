@@ -45,7 +45,7 @@ from frontier.rl.sched.agents import baseline_agent
 from frontier.rl.sched.reward import RewardConfig, episode_metric_samples
 from frontier.rl.sched.rollout import WorkloadConfig
 from frontier.rl.sched.torch_agent import TorchAgent
-from frontier.rl.sched.train import TrainConfig, load_checkpoint
+from frontier.rl.sched.train import TrainConfig, load_checkpoint, load_config
 
 WORKLOADS = [
     {"name": "qps10_blocks4000", "qps": 10, "num_blocks": 4000, "num_requests": 300},
@@ -106,9 +106,14 @@ def _frontier_settings(train_config: TrainConfig) -> Dict:
 
 
 def run_workload(args) -> str:
-    workload, checkpoint_path, seeds, data_dir, backend, policies = args
-    checkpoint = load_checkpoint(checkpoint_path)
-    train_config = TrainConfig(**checkpoint["train_config"])
+    workload, checkpoint_path, config_path, seeds, data_dir, backend, policies = args
+    needs_checkpoint = any(p.startswith("policy_") for p in policies)
+    checkpoint = load_checkpoint(checkpoint_path) if needs_checkpoint or not config_path else None
+    # --config: settings (Frontier engine, observation) from a training config
+    # rather than from the checkpoint's (e.g. after an engine change)
+    train_config = (
+        load_config(config_path) if config_path else TrainConfig(**checkpoint["train_config"])
+    )
     assert backend == "frontier", backend
     workload = dict(
         workload, backend="frontier", frontier=_frontier_settings(train_config)
@@ -213,6 +218,12 @@ def plot_all(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--checkpoint", default="rl_runs/run2/best.pt")
+    parser.add_argument(
+        "--config", default=None,
+        help="training config whose Frontier and observation settings to use "
+        "instead of the checkpoint's (the checkpoint is then only read for "
+        "policy_* lines)",
+    )
     parser.add_argument("--output-dir", default="rl_runs/cdf_plots")
     parser.add_argument(
         "--seeds", type=int, nargs="*", default=list(range(1000000, 1000005))
@@ -243,13 +254,13 @@ def main() -> None:
     os.makedirs(data_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "workloads.yaml"), "w") as f:
         yaml.safe_dump(
-            {"checkpoint": args.checkpoint, "seeds": args.seeds,
+            {"checkpoint": args.checkpoint, "config": args.config, "seeds": args.seeds,
              "backend": args.backend, "policies": list(policies),
              "workloads": WORKLOADS}, f, sort_keys=False,
         )
     # one task per (workload, policy) so a few workloads still use every worker
     tasks = [
-        (w, args.checkpoint, args.seeds, data_dir, args.backend, (p,))
+        (w, args.checkpoint, args.config, args.seeds, data_dir, args.backend, (p,))
         for w in WORKLOADS for p in policies
     ]
     with mp.get_context("spawn").Pool(args.workers) as pool:

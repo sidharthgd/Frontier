@@ -77,6 +77,18 @@ class _FreeOrder:
         return total
 
 
+# How both RL environments use the hook (frontier/rl/env.py and
+# frontier/rl/sched/frontier_env.py): every non-empty waiting queue gets
+# priorities, even a single request, because a priority outlives admission:
+# priority-mode preemption evicts the running request with the largest
+# (priority, arrival), and a request never ranked keeps the default 0, which
+# would shield it from preemption. A ranking only becomes an RL decision
+# (transition) when at least MIN_WAITING_TO_RECORD requests wait: a lone
+# request has nothing to be reordered against. A ranking that admitted
+# nothing is undone (no effect on admission, so none on preemption either).
+MIN_WAITING_TO_RECORD = 2
+
+
 class PriorityPolicy:
     """
     What the scheduler calls. get_priorities returns one priority per request
