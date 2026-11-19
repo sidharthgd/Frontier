@@ -263,21 +263,23 @@ def test_peek_cached_prefix_counts_hits_without_touching_stats():
 
 
 def test_sjf_sizes_jobs_by_uncached_prompt_tokens():
-    from frontier.rl.agents import OracleSJFAgent, PromptSJFAgent
-    from frontier.rl.observation import build_observation
+    from frontier.rl.frontier_env import _OracleRequest
+    from frontier.rl.history import job_size
+    from frontier.rl.prefix_cache import cached_prefix_tokens
 
     scheduler = _cached_scheduler(range(100, 160))  # 60 blocks cached
     # mostly cached long call (60 of 63 blocks cached: ~3 blocks of work),
     # against a shorter call with nothing cached (20 blocks of work)
     cached_long = Request(0.0, 63 * 16, 50, block_hash_ids=list(range(100, 163)))
     uncached_short = Request(0.0, 20 * 16, 50, block_hash_ids=list(range(500, 520)))
-    waiting = [uncached_short, cached_long]
-    obs = build_observation(1.0, waiting, scheduler, num_priority_levels=16)
-    assert obs.waiting_feature("cached_prompt_tokens").tolist() == [0, 60 * 16]
-
-    oracle, _ = OracleSJFAgent().act_oracle(obs, waiting, scheduler)
-    prompt, _ = PromptSJFAgent().act_oracle(obs, waiting, scheduler)
-    assert list(oracle) == [1, 0] and list(prompt) == [1, 0]  # cached long call first
+    cached = [cached_prefix_tokens(scheduler, r) for r in (uncached_short, cached_long)]
+    assert cached == [0, 60 * 16]
+    oracle = [_OracleRequest(r, c) for r, c in zip((uncached_short, cached_long), cached)]
+    # prompt and total SJF both put the cached long call first
+    for key in ("prefill_tokens", "total_tokens"):
+        sizes = [job_size(r, key, 2048) for r in oracle]
+        assert sizes[1] < sizes[0], key
+    assert [job_size(r, "prefill_tokens", 2048) for r in oracle] == [20 * 16, 3 * 16]
 
 
 def test_output_ids_follow_into_the_next_prompt():

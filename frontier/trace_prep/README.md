@@ -86,17 +86,9 @@ python -m frontier.trace_prep sample data/processed_traces/tracelab_coding_128k.
 python -m frontier.trace_prep describe workload.csv
 ```
 
-In the RL environments:
-
-```python
-# Frontier (frontier/rl/env.py): a fresh sample per seed
-WorkloadSpec(name="tracelab", arrivals="sessions", session_trace="data/processed_traces/tracelab_coding_128k.csv",
-             num_requests=500, qps=2, max_tokens=131072, enable_prefix_caching=True,
-             model="llama3.1-8b", device="a100", network_device="a100_dgx", ...)
-```
+In the RL environment (frontier/rl, a workload in configs/rl/*.yaml):
 
 ```yaml
-# Vidur RL stack on Frontier (vidur/rl/frontier_env.py)
 - name: tracelab_qps2
   trace: tracelab            # or freeinference, sharegpt_multiturn, or a path
   arrivals: sessions

@@ -10,9 +10,9 @@ CONFIG=configs/rl/frontier_imitation.yaml
 
 mkdir -p rl_runs/frontier_imitation rl_runs/frontier_imitation_ppo
 echo "imitation start $(date)"
-$PY -m frontier.rl.sched.imitation --config $CONFIG > rl_runs/frontier_imitation/train.log 2>&1
+$PY -m frontier.rl.imitation --config $CONFIG > rl_runs/frontier_imitation/train.log 2>&1
 echo "imitation done $(date)"
-$PY -m frontier.rl.sched.train --config $CONFIG \
+$PY -m frontier.rl.train --config $CONFIG \
     --set init_checkpoint=rl_runs/frontier_imitation/best.pt \
     --set output_dir=rl_runs/frontier_imitation_ppo \
     > rl_runs/frontier_imitation_ppo/train.log 2>&1 \
@@ -26,7 +26,7 @@ cdfs() {  # <checkpoint> <output dir> <label>
     for f in rl_runs/frontier_synthetic_cdfs/data/*__{fcfs,sjf_prefill_tokens,sjf_prefill_tokens_age200}.npz; do
         cp -n $f $2/data/
     done
-    $PY -m frontier.rl.sched.plot_cdfs --backend frontier \
+    $PY -m frontier.rl.plot_cdfs --backend frontier \
         --workloads rl_runs/frontier_synthetic_cdfs/eval_workloads.yaml \
         --checkpoint $1 --output-dir $2 --workers 4 \
         --policies fcfs sjf_prefill_tokens_age200 sjf_prefill_tokens policy_rank \

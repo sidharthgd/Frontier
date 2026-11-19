@@ -12,9 +12,9 @@ FT=rl_runs/frontier_concurrency_ppo
 
 mkdir -p $IM $FT
 echo "imitation start $(date)"
-$PY -m frontier.rl.sched.imitation --config $CONFIG > $IM/train.log 2>&1 \
+$PY -m frontier.rl.imitation --config $CONFIG > $IM/train.log 2>&1 \
     && echo "imitation done $(date)" || { echo "imitation FAILED $(date)"; exit 1; }
-$PY -m frontier.rl.sched.train --config $CONFIG \
+$PY -m frontier.rl.train --config $CONFIG \
     --set init_checkpoint=$IM/best.pt --set output_dir=$FT \
     > $FT/train.log 2>&1 \
     && echo "ppo done $(date)" || echo "ppo FAILED $(date)"
@@ -24,7 +24,7 @@ $PY -m frontier.rl.sched.train --config $CONFIG \
 cdfs() {  # <checkpoint> <output dir> <label>
     mkdir -p $2/data
     [ -d rl_runs/frontier_concurrency_cdfs_shared ] && cp -n rl_runs/frontier_concurrency_cdfs_shared/*.npz $2/data/ 2>/dev/null
-    $PY -m frontier.rl.sched.plot_cdfs --backend frontier \
+    $PY -m frontier.rl.plot_cdfs --backend frontier \
         --workloads configs/rl/frontier_concurrency_cdf_workloads.yaml \
         --checkpoint $1 --output-dir $2 --workers 4 --seeds 1000000 1000001 1000002 \
         --policies fcfs sjf_prefill_tokens_age200 sjf_prefill_tokens policy_argmax \

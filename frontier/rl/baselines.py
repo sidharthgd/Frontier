@@ -2,9 +2,9 @@
 Compare baseline schedulers on the same workloads, and check reward weights
 against them:
 
-    python -m frontier.rl.sched.baselines --qps 10 --num-blocks 4000 --seeds 0 1 2 3 4
-    python -m frontier.rl.sched.baselines --qps 10 --num-blocks 4000 --weight-check
-    python -m frontier.rl.sched.baselines --check-assumptions \
+    python -m frontier.rl.baselines --qps 10 --num-blocks 4000 --seeds 0 1 2 3 4
+    python -m frontier.rl.baselines --qps 10 --num-blocks 4000 --weight-check
+    python -m frontier.rl.baselines --check-assumptions \
         --workload '{name: sharegpt_qps20, trace: sharegpt, qps: 20}' \
         --workload '{name: azure_conv_replay, trace: azure_conv, arrivals: trace, qps: null}'
 
@@ -32,15 +32,15 @@ from typing import List, Optional, Sequence
 import pandas as pd
 import yaml
 
-from frontier.rl.sched.env import SchedulingEnv
-from frontier.rl.sched.observation import ObservationConfig
-from frontier.rl.sched.reward import (
+from frontier.rl.env import SchedulingEnv
+from frontier.rl.observation import ObservationConfig
+from frontier.rl.reward import (
     RewardConfig,
     episode_cost,
     episode_cost_components,
     window_thresholds,
 )
-from frontier.rl.sched.rollout import WorkloadConfig
+from frontier.rl.rollout import WorkloadConfig
 
 METRICS = (
     "mean_e2e",

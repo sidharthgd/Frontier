@@ -3,16 +3,16 @@ Checks for the trace workloads (make_request_generator_config, the
 trace-window replay generator, and the baseline assumption check).
 
 Run from the repo root (so ./data resolves):
-    python -m pytest tests/rl/sched/test_rl_workloads.py -v
+    python -m pytest tests/rl/test_rl_workloads.py -v
 """
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from frontier.rl.sched.baselines import check_assumptions, relative_to_fcfs
-from frontier.rl.sched.env import TRACE_FILES, _set_workload_seed, make_request_generator_config
-from frontier.rl.sched.workload import TraceWindowRequestGeneratorConfig, generate_requests
+from frontier.rl.baselines import check_assumptions, relative_to_fcfs
+from frontier.rl.env import TRACE_FILES, _set_workload_seed, make_request_generator_config
+from frontier.rl.workload import TraceWindowRequestGeneratorConfig, generate_requests
 
 
 def _generate(config):
@@ -139,7 +139,7 @@ def test_check_assumptions():
 
 @pytest.mark.parametrize("trace", ["tracelab", "sharegpt_multiturn"])
 def test_session_workloads_carry_prefix_cache_keys(trace):
-    from frontier.rl.sched.workload import SESSION_TRACE_FILES, _session_trace_file
+    from frontier.rl.workload import SESSION_TRACE_FILES, _session_trace_file
 
     import os
 
@@ -175,7 +175,7 @@ def test_session_workloads_carry_prefix_cache_keys(trace):
 def test_job_size_skips_prefix_cached_prompt_tokens():
     from types import SimpleNamespace
 
-    from frontier.rl.sched.history import job_size
+    from frontier.rl.history import job_size
 
     plain = SimpleNamespace(num_prefill_tokens=120_000, num_decode_tokens=200)
     cached = SimpleNamespace(num_prefill_tokens=120_000, num_decode_tokens=200,
@@ -191,8 +191,8 @@ def test_frontier_oracle_requests_carry_cache_hits():
 
     from frontier.entities import Request as FrontierRequest
     from frontier.kv_cache.base_kv_cache_manager import KVCacheManager
-    from frontier.rl.observation import cached_prefix_tokens
-    from frontier.rl.sched.frontier_env import _OracleRequest
+    from frontier.rl.prefix_cache import cached_prefix_tokens
+    from frontier.rl.frontier_env import _OracleRequest
 
     manager = KVCacheManager(block_size=16, num_gpu_blocks=8, enable_caching=True,
                              caching_hash_algo="builtin", num_preallocate_tokens=0)
@@ -231,8 +231,8 @@ def test_prefix_cache_state_counts_idle_blocks_and_caps_last_token():
 def test_prefix_cache_features():
     from types import SimpleNamespace
 
-    from frontier.rl.sched.features import FeatureContext
-    from frontier.rl.sched.observation import (
+    from frontier.rl.features import FeatureContext
+    from frontier.rl.observation import (
         DEFAULT_GLOBAL_FEATURES,
         PREFIX_CACHE_GLOBAL_FEATURES,
         PREFIX_CACHE_WAITING_FEATURES,
@@ -261,7 +261,7 @@ def test_prefix_cache_features():
         max_num_batched_tokens=2048, num_priority_levels=16, num_running_requests=0,
         rank_mask=[True, True], running_requests=[], recent_prefix_hit_rate=0.5,
         request_history=lambda _: __import__(
-            "frontier.rl.sched.history",
+            "frontier.rl.history",
             fromlist=["RequestHistory"],
         ).RequestHistory(),
         window_stats=lambda metric, window: (0.0, 0.0, 0.0),

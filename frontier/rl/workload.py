@@ -29,7 +29,7 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-from frontier.rl.env import FRONTIER_ROOT
+from frontier.rl.engine import FRONTIER_ROOT
 from frontier.rl.scoring import CONCURRENT_OVERPROVISION
 from frontier.utils.random import set_seeds
 

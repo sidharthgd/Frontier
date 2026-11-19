@@ -1,7 +1,7 @@
 # Agentic session traces with prefix caching on Frontier: A100 80GB +
 # Llama-3.1-8B (128k context; Frontier data/profiling/compute/a100/llama3.1-8b).
 # Traces are built by Frontier's frontier/trace_prep (README there) and named
-# in SESSION_TRACE_FILES (frontier/rl/sched/env.py).
+# in SESSION_TRACE_FILES (frontier/rl/env.py).
 #
 # arrivals: sessions overlays whole agent sessions, closed loop: a session's
 # next call arrives only after its previous call completes (plus the trace's
@@ -64,7 +64,7 @@ workloads:
   backend: frontier
   frontier: *frontier
 eval_workloads: null
-# prefix-cache features (frontier/rl/sched/observation.py PREFIX_CACHE_*): uncached
+# prefix-cache features (frontier/rl/observation.py PREFIX_CACHE_*): uncached
 # prompt tokens and blocks, cached fraction, admission memory cost, the
 # uncached-SJF rank, queued uncached work and the recent hit rate
 observation:

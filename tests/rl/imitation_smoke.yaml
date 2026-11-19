@@ -1,4 +1,4 @@
-# Small imitation + PPO config for tests/rl/sched/test_rl_imitation.py (the tests override
+# Small imitation + PPO config for tests/rl/test_rl_imitation.py (the tests override
 # workloads, sizes and output_dir); from Vidur's configs/rl/imitation_sjf_age800.yaml.
 output_dir: rl_runs/imitation_sjf_age800
 seed: 0
@@ -9,7 +9,7 @@ workloads:
 
 num_priority_levels: 16
 
-observation: {}  # default features (frontier/rl/sched/observation.py)
+observation: {}  # default features (frontier/rl/observation.py)
 
 reward:
   weights: {e2e_normalized: 1.0, e2e_hinge: 0.3}

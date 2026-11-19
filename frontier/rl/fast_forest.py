@@ -13,7 +13,7 @@ returns or raises what sklearn would.
 Bit-identity relies on sklearn's tree layout and its float32 cast of inputs
 (checked on sklearn 1.9.1; tests/rl/test_fast_forest.py).
 
-frontier/rl/env.py installs it on import; FRONTIER_FAST_FOREST=0 (or the older
+frontier/rl/engine.py installs it on import; FRONTIER_FAST_FOREST=0 (or the older
 VIDUR_FRONTIER_FAST_FOREST=0) keeps sklearn's.
 """
 

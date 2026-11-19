@@ -2,14 +2,14 @@
 Imitation learning from an oracle SJF teacher with DAgger (docs/rl_plan.md §8),
 as an initialization for PPO fine-tuning:
 
-    python -m frontier.rl.sched.imitation --config configs/rl/imitation_sjf_age800.yaml
-    python -m frontier.rl.sched.train --config configs/rl/imitation_sjf_age800.yaml \\
+    python -m frontier.rl.imitation --config configs/rl/imitation_sjf_age800.yaml
+    python -m frontier.rl.train --config configs/rl/imitation_sjf_age800.yaml \\
         --set init_checkpoint=rl_runs/imitation_sjf_age800/best.pt \\
         --set output_dir=rl_runs/imitation_sjf_age800_ppo
 
 The teacher (imitation.teacher, an SJF baseline name such as
 sjf_total_tokens_age800) ranks by the true output length; the student sees the
-usual observation, which never contains it (frontier/rl/sched/teacher.py).
+usual observation, which never contains it (frontier/rl/teacher.py).
 
 DAgger: the first rollouts are the teacher's own (initial_seeds). Each
 iteration then trains the student on every labeled decision collected so far,
@@ -22,7 +22,7 @@ teacher's states alone (behavior cloning) does not teach.
 Only decisions with an admission boundary are trained on: when everything
 waiting was admitted, the ranking changed nothing.
 
-Checkpoints have the same format as frontier.rl.sched.train's, so frontier.rl.sched.evaluate and
+Checkpoints have the same format as frontier.rl.train's, so frontier.rl.evaluate and
 init_checkpoint both read them. Metrics go to <output_dir>/metrics.jsonl:
 imitation losses, the student's pair accuracy on its training data, and per
 eval decoding the usual eval metrics plus agreement with the teacher
@@ -39,17 +39,17 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-from frontier.rl.sched.model import collate, interval_targets, modeled_indices
-from frontier.rl.sched.ppo import make_optimizer, minibatches
-from frontier.rl.sched.rollout import RolloutTask, Trajectory
-from frontier.rl.sched.teacher import has_labels, imitation_losses, imitation_targets
-from frontier.rl.sched.torch_agent import DECODINGS
-from frontier.rl.sched.train import TRAIN_SEED_LIMIT, Trainer, load_config, trajectory_metrics
+from frontier.rl.model import collate, interval_targets, modeled_indices
+from frontier.rl.ppo import make_optimizer, minibatches
+from frontier.rl.rollout import RolloutTask, Trajectory
+from frontier.rl.teacher import has_labels, imitation_losses, imitation_targets
+from frontier.rl.torch_agent import DECODINGS
+from frontier.rl.train import TRAIN_SEED_LIMIT, Trainer, load_config, trajectory_metrics
 
 
 @dataclass
 class ImitationConfig:
-    # SJF baseline name (frontier.rl.sched.agents.baseline_agent); an _<L>lvl suffix is
+    # SJF baseline name (frontier.rl.agents.baseline_agent); an _<L>lvl suffix is
     # ignored, the labels are cut into the env's priority levels
     teacher: str = "sjf_total_tokens_age800"
     iterations: int = 10

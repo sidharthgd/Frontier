@@ -2,10 +2,10 @@
 CDFs of TTFT, TBT, request e2e time and batch size (the plots in the README)
 for baselines and a trained policy, pooled over seeds:
 
-    python -m frontier.rl.sched.plot_cdfs --checkpoint rl_runs/run2/best.pt \\
+    python -m frontier.rl.plot_cdfs --checkpoint rl_runs/run2/best.pt \\
         --output-dir rl_runs/cdf_plots
 
-Every workload runs in Frontier (frontier/rl/sched/frontier_env.py) with the
+Every workload runs in Frontier (frontier/rl/frontier_env.py) with the
 checkpoint's Frontier settings (--backend frontier is accepted for old
 scripts). --workloads replaces WORKLOADS with a YAML list of the same form
 (e.g. configs/rl/frontier_cdf_workloads.yaml).
@@ -13,7 +13,7 @@ scripts). --workloads replaces WORKLOADS with a YAML list of the same form
 --policies picks the lines (baseline names, and policy_rank for the
 checkpoint), e.g. an imitation student against its teacher:
 
-    python -m frontier.rl.sched.plot_cdfs \\
+    python -m frontier.rl.plot_cdfs \\
         --checkpoint rl_runs/imitation_sjf_age400/latest.pt \\
         --output-dir rl_runs/cdf_plots_imitation_age400 \\
         --policies fcfs sjf_total_tokens_age400 \\
@@ -41,11 +41,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
-from frontier.rl.sched.agents import baseline_agent
-from frontier.rl.sched.reward import RewardConfig, episode_metric_samples
-from frontier.rl.sched.rollout import WorkloadConfig
-from frontier.rl.sched.torch_agent import TorchAgent
-from frontier.rl.sched.train import TrainConfig, load_checkpoint, load_config
+from frontier.rl.agents import baseline_agent
+from frontier.rl.reward import RewardConfig, episode_metric_samples
+from frontier.rl.rollout import WorkloadConfig
+from frontier.rl.torch_agent import TorchAgent
+from frontier.rl.train import TrainConfig, load_checkpoint, load_config
 
 WORKLOADS = [
     {"name": "qps10_blocks4000", "qps": 10, "num_blocks": 4000, "num_requests": 300},

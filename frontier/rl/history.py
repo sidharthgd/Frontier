@@ -98,9 +98,8 @@ def job_size(request, key: str, max_num_batched_tokens: int) -> int:
                      uncached-prompt SJF with a prefix cache
 
     Prefill work is num_prefill_tokens less num_cached_prefill_tokens. On
-    Frontier, frontier_env._OracleRequest gives a request in the terms of
-    frontier/rl/observation.py's job_size_tokens, the size
-    FrontierSchedulingEnv's SJF baselines use too: num_prefill_tokens is what
+    Frontier, frontier_env._OracleRequest gives a request in these terms:
+    num_prefill_tokens is what
     admission must compute (a victim preempted after prefill recomputes its
     prompt and kept output), num_cached_prefill_tokens what the prefix cache
     holds of it, num_decode_tokens the output still to generate. A 120k prompt

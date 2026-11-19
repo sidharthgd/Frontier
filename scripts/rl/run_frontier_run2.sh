@@ -3,8 +3,8 @@
 cd "$(dirname "$0")/../.."
 export PYTHONPATH=$PWD
 PY=.venv/bin/python
-$PY -m frontier.rl.sched.train --config configs/rl/frontier_run2.yaml > rl_runs/frontier_run2/train.log 2>&1 || { echo TRAIN_FAILED >> rl_runs/frontier_run2/train.log; exit 1; }
-$PY -m frontier.rl.sched.plot_cdfs --backend frontier --checkpoint rl_runs/frontier_run2/best.pt \
+$PY -m frontier.rl.train --config configs/rl/frontier_run2.yaml > rl_runs/frontier_run2/train.log 2>&1 || { echo TRAIN_FAILED >> rl_runs/frontier_run2/train.log; exit 1; }
+$PY -m frontier.rl.plot_cdfs --backend frontier --checkpoint rl_runs/frontier_run2/best.pt \
     --workloads configs/rl/frontier_cdf_workloads.yaml --output-dir rl_runs/frontier_cdf_plots \
     --workers 3 > rl_runs/frontier_cdf_plots.log 2>&1 || { echo PLOT_FAILED >> rl_runs/frontier_cdf_plots.log; exit 1; }
 echo ALL_DONE >> rl_runs/frontier_cdf_plots.log

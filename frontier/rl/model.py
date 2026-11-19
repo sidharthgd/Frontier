@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from frontier.rl.sched.observation import Observation
+from frontier.rl.observation import Observation
 
 ENCODERS = ("transformer", "deepsets", "mlp_pool")
 HEADS = ("ordinal", "categorical")

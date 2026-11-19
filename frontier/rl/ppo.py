@@ -17,7 +17,7 @@ PPO for the queue-ranking scheduler (docs/rl_plan.md §3, §4, §6 step 6).
 - Returns are divided by a running std, so reward scale changes (QPS, reward
   weights) do not need retuning.
 - Optional imitation anchor (imitation_coef > 0, for fine-tuning an imitation
-  policy): the teacher's imitation loss (frontier/rl/sched/teacher.py) on the rollouts'
+  policy): the teacher's imitation loss (frontier/rl/teacher.py) on the rollouts'
   labeled decisions is added to the policy loss.
 """
 
@@ -30,9 +30,9 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 
-from frontier.rl.sched.model import SchedulerModel, collate, interval_targets, modeled_indices
-from frontier.rl.sched.rollout import Trajectory
-from frontier.rl.sched.teacher import imitation_losses, imitation_targets
+from frontier.rl.model import SchedulerModel, collate, interval_targets, modeled_indices
+from frontier.rl.rollout import Trajectory
+from frontier.rl.teacher import imitation_losses, imitation_targets
 
 ADVANTAGE_MODES = ("group", "gae")
 ADVANTAGE_NORMALIZATIONS = ("workload", "batch", "none")

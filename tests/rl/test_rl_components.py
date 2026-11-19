@@ -5,7 +5,7 @@ episodes. (Vidur's own scheduler checks stayed in the Vidur repo with its
 simulator backend.)
 
 Run from the repo root:
-    python -m pytest tests/rl/sched/test_rl_components.py -v
+    python -m pytest tests/rl/test_rl_components.py -v
 """
 
 import dataclasses
@@ -14,12 +14,13 @@ import math
 import numpy as np
 import pytest
 
-from frontier.rl.sched import FCFSAgent, RandomAgent, RewardConfig, per_request_reward_components
-from frontier.rl.sched.frontier_env import _RequestView
-from frontier.rl.sched.history import SlidingWindow
-from frontier.rl.sched.observation import ObservationConfig
-from frontier.rl.sched.reward import PER_REQUEST_COMPONENTS, episode_cost_components
-from frontier.rl.sched.rollout import WorkloadConfig
+from frontier.rl.agents import FCFSAgent, RandomAgent
+from frontier.rl.reward import RewardConfig, per_request_reward_components
+from frontier.rl.frontier_env import _RequestView
+from frontier.rl.history import SlidingWindow
+from frontier.rl.observation import ObservationConfig
+from frontier.rl.reward import PER_REQUEST_COMPONENTS, episode_cost_components
+from frontier.rl.rollout import WorkloadConfig
 
 WORKLOAD_SEED = 0
 

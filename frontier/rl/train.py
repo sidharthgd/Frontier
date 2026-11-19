@@ -1,8 +1,8 @@
 """
 Train the queue-ranking scheduler with PPO (docs/rl_plan.md §6 step 7):
 
-    python -m frontier.rl.sched.train --config configs/rl/ppo_default.yaml
-    python -m frontier.rl.sched.train --config configs/rl/ppo_default.yaml \\
+    python -m frontier.rl.train --config configs/rl/ppo_default.yaml
+    python -m frontier.rl.train --config configs/rl/ppo_default.yaml \\
         --set iterations=5 --set ppo.epochs=2 --set output_dir=rl_runs/smoke
 
 Each iteration samples workload seeds, runs group_size rollouts per seed,
@@ -12,7 +12,7 @@ fraction of the FCFS-to-SJF mean gap closed, latency tails, PPO stats) to
 the deterministic policy runs on held-out eval seeds; the best checkpoint by
 eval improvement over FCFS is kept.
 
-Fine-tuning an imitation policy (frontier/rl/sched/imitation.py): set init_checkpoint
+Fine-tuning an imitation policy (frontier/rl/imitation.py): set init_checkpoint
 to its checkpoint. With imitation.teacher set, eval rollouts also record the
 teacher's ranking and log agreement with it; with ppo.imitation_coef > 0 the
 training rollouts do too, and PPO adds the imitation loss as an anchor.
@@ -37,19 +37,19 @@ import numpy as np
 import torch
 import yaml
 
-from frontier.rl.sched.model import ModelConfig, SchedulerModel, config_for
-from frontier.rl.sched.observation import ObservationConfig
-from frontier.rl.sched.ppo import (
+from frontier.rl.model import ModelConfig, SchedulerModel, config_for
+from frontier.rl.observation import ObservationConfig
+from frontier.rl.ppo import (
     PPOConfig,
     RunningStd,
     make_optimizer,
     ppo_update,
     resolve_device,
 )
-from frontier.rl.sched.reward import RewardConfig
-from frontier.rl.sched.teacher import agreement_metrics
-from frontier.rl.sched.torch_agent import DECODINGS
-from frontier.rl.sched.rollout import (
+from frontier.rl.reward import RewardConfig
+from frontier.rl.teacher import agreement_metrics
+from frontier.rl.torch_agent import DECODINGS
+from frontier.rl.rollout import (
     RolloutCollector,
     RolloutTask,
     Trajectory,
@@ -70,7 +70,7 @@ class TrainConfig:
     reward: Dict[str, Any] = field(default_factory=dict)
     model: Dict[str, Any] = field(default_factory=dict)
     ppo: Dict[str, Any] = field(default_factory=dict)
-    # ImitationConfig (frontier/rl/sched/imitation.py); its teacher also labels PPO
+    # ImitationConfig (frontier/rl/imitation.py); its teacher also labels PPO
     # rollouts (see the module docstring)
     imitation: Dict[str, Any] = field(default_factory=dict)
     # start PPO from these model weights (e.g. an imitation checkpoint)
@@ -189,7 +189,7 @@ def trajectory_metrics(
             "p99_tbt": mean([t.summary["p99_tbt"] for t in group]),
             "decision_ms": 1e3 * mean([t.decision_time_s for t in group]),
         }
-        # Frontier session workloads (frontier/rl/sched/frontier_env.py)
+        # Frontier session workloads (frontier/rl/frontier_env.py)
         for key in OPTIONAL_SUMMARY_KEYS:
             values = [t.summary[key] for t in group if key in t.summary]
             if values:

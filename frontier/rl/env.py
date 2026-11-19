@@ -1,764 +1,318 @@
 """
-RL environment on top of Frontier (ported from our Vidur fork, vidur/rl/env.py).
+What the RL stack's environments share: the Transition and Episode records,
+episode summaries, and SchedulingEnv's reference runs (baselines on the same
+workload), reward thresholds and normalization. FrontierEnv
+(frontier_env.py) is the environment; it simulates episodes in Frontier.
 
-    env = FrontierSchedulingEnv(WorkloadSpec(name="toy", qps=10, num_requests=200))
-    episode = env.run_episode(agent, seed=0)
-
-run_episode runs one simulation to the end. Whenever the vLLM v1 scheduler is
-about to admit waiting requests, it builds an Observation, asks the agent for
-one priority per waiting request (agent.act(obs) -> (priorities, info)), and
-lets vLLM admit from the front of the (priority, arrival, id) order.
-
-A decision is kept as a Transition only if it admitted something. Otherwise
-the ranking had no effect: the previous priorities are restored (priorities
-also drive preemption, so leaving them would be an effect) and the decision
-is dropped. Each kept transition gets the reward components that accrue until
-the next kept decision (vidur/rl/reward.py semantics), computed from request
-timings after the episode; weights are a RewardConfig, chosen by the trainer.
-
-Nothing here decides features transforms, reward weights or the model. Feature
-values are raw; normalization is the model's job.
+Ported from the Vidur repo (branch frontier-backend, vidur/rl/env.py), whose
+own simulator backend stayed behind.
 """
 
-import os
-import sys
-from contextlib import contextmanager
+import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from frontier.entities import Batch, Request
-from frontier.rl import fast_forest
-from frontier.rl.observation import Observation, build_observation
-from frontier.rl.reward import RewardConfig, transition_components
-from frontier.simulator import Simulator
-from frontier.rl.scoring import ScoreWindow
-from frontier.rl.scheduler import (
-    MIN_WAITING_TO_RECORD,
-    PriorityPolicy,
-    RLVLLMv1EngineReplicaScheduler,
-    replica_schedulers,
-    rl_scheduler_installed,
+from frontier.entities import Request
+from frontier.rl.agents import BaseAgent, FCFSAgent, OracleAgent, baseline_agent
+from frontier.rl.observation import Observation, ObservationConfig
+from frontier.rl.reward import (
+    MEAN_COMPONENT_REFERENCES,
+    THRESHOLD_METRICS,
+    RewardConfig,
+    RewardContext,
+    episode_cost,
+    episode_cost_components,
+    episode_metric_samples,
+    window_thresholds,
+    TTFT_REF_THRESHOLD,
+    reference_ttft_thresholds,
+    zero_components,
 )
-
-
-@dataclass
-class WorkloadSpec:
-    """
-    One workload. Lengths come from `length_trace` (a CSV with
-    num_prefill_tokens, num_decode_tokens) or are fixed; arrivals are Poisson,
-    Gamma (cv > 1 is bursty) or, with `replay_trace`, replayed from a CSV
-    with arrived_at (and optionally session_id, block_hash_ids,
-    thinking_round_plans_json, tool_call_latency) that also gives lengths.
-
-    arrivals="sessions" samples num_requests calls at qps from the session
-    trace `session_trace` (frontier/trace_prep), whole sessions with their
-    own call gaps, the seed choosing sessions and phases; with
-    enable_prefix_caching, calls reuse their session's earlier prompts. With
-    session_closed_loop (default), a session's next call arrives only after
-    its previous call completes (plus the trace's think time).
-    """
-
-    name: str
-    num_requests: int = 300
-    qps: float = 10.0
-    arrivals: str = "poisson"  # poisson | gamma | replay | sessions
-    cv: float = 1.0
-    length_trace: Optional[str] = None
-    prefill_tokens: int = 1000
-    decode_tokens: int = 200
-    replay_trace: Optional[str] = None
-    replay_time_scale: float = 1.0
-    # arrivals="sessions" (frontier/trace_prep/sessions.py)
-    session_trace: Optional[str] = None
-    session_time_scale: float = 1.0
-    turn_gap: float = 30.0
-    session_phase: str = "stationary"
-    # a session's next call waits for its previous one (sessions.py)
-    session_closed_loop: bool = True
-    # seconds of warm-up calls before the num_requests scored ones: simulated,
-    # not scored (frontier/rl/scoring.py)
-    session_warmup: float = 0.0
-    # > 0: a closed system of this many agents running sessions back to back
-    # (sessions.sample_concurrent_workload) instead of a qps window; each
-    # agent's first ceil(num_requests / agents) calls after session_warmup
-    # are scored and the episode stops once they finish (scoring.ScoreWindow)
-    session_concurrency: int = 0
-    # with session_concurrency: mean gap before an agent's next session
-    session_gap: float = 30.0
-    max_tokens: int = 4096
-    # hardware and engine
-    model: str = "llama2_7b_dense_example"
-    device: str = "h200"
-    network_device: str = "h200_dgx"
-    tensor_parallel: int = 1
-    max_tokens_in_batch: int = 2048
-    batch_size_cap: int = 256
-    num_blocks: Optional[int] = None
-    enable_prefix_caching: bool = False
-    # fixed time per batch instead of the profiled predictor (plumbing tests)
-    dummy_exec_ms: Optional[float] = None
-    # Frontier's per-step CPU overhead model (off by default in Frontier)
-    model_cpu_overhead: bool = True
-    # Round every predictor input to this many significant bits (5 = within
-    # ~3%), so that prediction memo hits across episodes; None = exact.
-    # Approximate, like Vidur's 64-token KV granularity; see rl/README.
-    prediction_rounding_bits: Optional[int] = None
-    # decode CUDA graphs as vLLM runs them: none | piecewise | full_decode_only
-    decode_cuda_graph_mode: str = "none"
-    # context limit (vLLM --max-model-len) and the predictor's lookup range
-    # (prediction_max_tokens_per_request None: max(max_tokens, 4096))
-    max_model_len: Optional[int] = None
-    prediction_max_tokens_per_request: Optional[int] = None
-    prediction_max_batch_size: Optional[int] = None
-    # any other frontier.main flags, e.g. ["--enable_thinking_mode", ...]
-    extra_args: List[str] = field(default_factory=list)
-
-
-def a100_llama31_8b(**overrides) -> "WorkloadSpec":
-    """
-    A100 80GB PCIe + Llama-3.1-8B as validated against vLLM 0.10.2
-    (data/profiling/compute/a100/llama3.1-8b/README.md): FlashInfer, 2048-token
-    steps, 256 sequences, 128k context, 453,088-token KV cache, piecewise CUDA
-    graphs, no CPU-overhead tables.
-    """
-    spec = dict(A100_LLAMA31_8B)
-    spec.update(overrides)
-    return WorkloadSpec(**spec)
-
-
-# a100_llama31_8b's settings (also a named preset for the training stack's
-# `frontier: {preset: a100_llama31_8b}`)
-A100_LLAMA31_8B = dict(
-    name="a100_llama31_8b",
-    model="llama3.1-8b", device="a100", network_device="a100_dgx",
-    max_tokens_in_batch=2048, batch_size_cap=256, num_blocks=28318,
-    decode_cuda_graph_mode="piecewise", model_cpu_overhead=False,
-    max_model_len=131072, prediction_max_tokens_per_request=131072,
-    prediction_max_batch_size=256, max_tokens=131072,
+from frontier.rl.workload import (  # noqa: F401 (re-exported)
+    SESSION_TRACE_FILES,
+    TRACE_FILES,
+    SimulationConfig,
+    make_request_generator_config,
+    make_simulation_config,
 )
-PRESETS = {"a100_llama31_8b": A100_LLAMA31_8B}
-
-
-def simulation_args(
-    spec: WorkloadSpec, seed: int, output_dir: str, log_level: str = "error"
-) -> List[str]:
-    args = [
-        "--log_level", log_level,
-        "--seed", str(seed),
-        "--sys_arch", "co-location",
-        "--simulation_mode", "online",
-        "--cc_backend_config_type", "analytical",
-        "--replica_config_model_name", spec.model,
-        "--replica_config_device", spec.device,
-        "--replica_config_network_device", spec.network_device,
-        "--replica_config_attn_tensor_parallel_size", str(spec.tensor_parallel),
-        "--replica_scheduler_config_type", "vllm_v1",
-        "--vllm_v1_scheduler_config_scheduling_policy", "priority",
-        "--vllm_v1_scheduler_config_enable_chunked_prefill",
-        "--vllm_v1_scheduler_config_max_tokens_in_batch", str(spec.max_tokens_in_batch),
-        "--vllm_v1_scheduler_config_batch_size_cap", str(spec.batch_size_cap),
-        "--decode_cuda_graph_mode", spec.decode_cuda_graph_mode,
-        "--random_forrest_execution_time_predictor_config_prediction_max_prefill_chunk_size",
-        str(max(spec.max_tokens_in_batch, 1024)),
-        # the predictor's own request-length limit (default 4096) must cover
-        # the workload's requests, e.g. 131072 for 128k-context traces
-        "--random_forrest_execution_time_predictor_config_prediction_max_tokens_per_request",
-        str(
-            spec.prediction_max_tokens_per_request
-            if spec.prediction_max_tokens_per_request is not None
-            else max(spec.max_tokens, 4096)
-        ),
-        "--metrics_config_output_dir", output_dir,
-        "--no-metrics_config_write_metrics",
-        "--no-metrics_config_store_plots",
-        "--no-metrics_config_enable_chrome_trace",
-        "--no-metrics_config_write_json_trace",
-    ]
-    args += [
-        "--no-random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling"
-        if spec.model_cpu_overhead
-        else "--random_forrest_execution_time_predictor_config_skip_cpu_overhead_modeling"
-    ]
-    if spec.dummy_exec_ms is not None:
-        args += [
-            "--random_forrest_execution_time_predictor_config_enable_dummy_mode",
-            "--random_forrest_execution_time_predictor_config_dummy_execution_time_ms",
-            str(spec.dummy_exec_ms),
-        ]
-    else:
-        args += ["--no-random_forrest_execution_time_predictor_config_enable_dummy_mode"]
-    if spec.num_blocks is not None:
-        args += [
-            "--vllm_v1_scheduler_config_num_blocks_mode", "explicit",
-            "--vllm_v1_scheduler_config_num_blocks", str(spec.num_blocks),
-        ]
-    if spec.enable_prefix_caching:
-        args += ["--vllm_v1_scheduler_config_enable_prefix_caching"]
-    if spec.max_model_len is not None:
-        args += ["--vllm_v1_scheduler_config_max_model_len", str(spec.max_model_len)]
-    if spec.prediction_max_batch_size is not None:
-        args += [
-            "--random_forrest_execution_time_predictor_config_prediction_max_batch_size",
-            str(spec.prediction_max_batch_size),
-        ]
-
-    if spec.arrivals in ("replay", "sessions"):
-        if spec.arrivals == "sessions":
-            replay_trace = session_workload_trace(spec, seed, output_dir)
-        else:
-            assert spec.replay_trace, "arrivals=replay needs replay_trace"
-            replay_trace = spec.replay_trace
-        args += [
-            "--request_generator_config_type", "trace_replay",
-            "--trace_request_generator_config_trace_file", replay_trace,
-            "--trace_request_generator_config_time_scale_factor", str(spec.replay_time_scale),
-            "--trace_request_generator_config_max_tokens", str(spec.max_tokens),
-            "--trace_request_generator_config_seed", str(seed),
-        ]
-    else:
-        args += [
-            "--request_generator_config_type", "synthetic",
-            "--synthetic_request_generator_config_num_requests", str(spec.num_requests),
-            # each generator has its own seed (default 42); --seed reaches none of them
-            "--synthetic_request_generator_config_seed", str(seed),
-        ]
-        if spec.length_trace:
-            args += [
-                "--length_generator_config_type", "trace",
-                "--trace_request_length_generator_config_trace_file", spec.length_trace,
-                "--trace_request_length_generator_config_max_tokens", str(spec.max_tokens),
-                "--trace_request_length_generator_config_seed", str(seed),
-            ]
-        else:
-            args += [
-                "--length_generator_config_type", "fixed",
-                "--fixed_request_length_generator_config_prefill_tokens", str(spec.prefill_tokens),
-                "--fixed_request_length_generator_config_decode_tokens", str(spec.decode_tokens),
-                "--fixed_request_length_generator_config_seed", str(seed),
-            ]
-        if spec.arrivals == "poisson":
-            args += [
-                "--interval_generator_config_type", "poisson",
-                "--poisson_request_interval_generator_config_qps", str(spec.qps),
-                "--poisson_request_interval_generator_config_seed", str(seed),
-            ]
-        elif spec.arrivals == "gamma":
-            args += [
-                "--interval_generator_config_type", "gamma",
-                "--gamma_request_interval_generator_config_qps", str(spec.qps),
-                "--gamma_request_interval_generator_config_cv", str(spec.cv),
-                "--gamma_request_interval_generator_config_seed", str(seed),
-            ]
-        else:
-            raise ValueError(f"unknown arrivals {spec.arrivals}")
-    return args + list(spec.extra_args)
-
-
-def session_workload_trace(spec: WorkloadSpec, seed: int, output_dir: str) -> str:
-    """The CSV that arrivals="sessions" replays for this seed, sampled once
-    and kept under output_dir/session_workloads."""
-    import hashlib
-
-    from frontier.trace_prep import synthetic
-    from frontier.rl.scoring import CONCURRENT_OVERPROVISION
-    from frontier.trace_prep.sessions import sample_named_workload
-
-    assert spec.session_trace, "arrivals=sessions needs session_trace"
-    trace = spec.session_trace if synthetic.is_synthetic(spec.session_trace) else os.path.abspath(spec.session_trace)
-    params = (
-        trace, spec.num_requests, spec.qps, seed, spec.max_tokens,
-        spec.session_time_scale, spec.turn_gap, spec.session_phase,
-        spec.session_closed_loop, spec.session_warmup, spec.session_concurrency,
-        spec.session_gap,
-    )
-    # a rebuilt trace file must not reuse workloads sampled from the old one
-    source = os.path.join(FRONTIER_ROOT, "frontier", "trace_prep", "synthetic.py") if synthetic.is_synthetic(trace) else trace
-    if os.path.exists(source):
-        stat = os.stat(source)
-        params += (stat.st_size, stat.st_mtime_ns)
-    key = hashlib.sha1(repr(params).encode()).hexdigest()[:16]
-    directory = os.path.join(os.path.abspath(output_dir), "session_workloads")
-    path = os.path.join(directory, f"{key}.csv")
-    if not os.path.exists(path):
-        os.makedirs(directory, exist_ok=True)
-        if spec.session_concurrency:
-            # closed system: over-provisioned calls; the score window takes
-            # each agent's quota after the warm-up and stops there
-            workload = sample_named_workload(
-                trace, CONCURRENT_OVERPROVISION * spec.num_requests, spec.qps, seed,
-                spec.max_tokens,
-                concurrency=spec.session_concurrency,
-                session_time_scale=spec.session_time_scale,
-                turn_gap=spec.turn_gap,
-                session_gap=spec.session_gap,
-            )
-        else:
-            workload = sample_named_workload(
-                trace, spec.num_requests, spec.qps, seed, spec.max_tokens,
-                session_time_scale=spec.session_time_scale,
-                turn_gap=spec.turn_gap,
-                phase=spec.session_phase,
-                closed_loop=spec.session_closed_loop,
-                **({"warmup": spec.session_warmup} if spec.session_warmup else {}),
-            )
-        write_replay_trace(path, workload)
-    return path
-
-
-# columns of a replayed session workload, as both RL stacks write them
-REPLAY_COLUMNS = (
-    "arrived_at", "num_prefill_tokens", "num_decode_tokens",
-    "session_id", "block_hash_ids", "think_time", "ids_cover_output", "warmup",
-)
-
-
-def write_replay_trace(path: str, workload) -> None:
-    """A sampled session workload (frontier/trace_prep/sessions.py) as the CSV
-    Frontier replays, written as frontier/rl/sched's FrontierEnv.workload_trace
-    writes it (same columns, types and float precision, rows in arrival
-    order), so both RL stacks replay identical workloads."""
-    import pandas as pd
-
-    columns = {
-        "arrived_at": workload["arrived_at"].astype(float),
-        "num_prefill_tokens": workload["num_prefill_tokens"].astype(int),
-        "num_decode_tokens": workload["num_decode_tokens"].astype(int),
-        "session_id": workload["session_id"].astype(int),
-        "block_hash_ids": workload["block_hash_ids"].astype(str),
-        "ids_cover_output": (
-            workload["ids_cover_output"].fillna(0).astype(int)
-            if "ids_cover_output" in workload else 0
-        ),
-        "think_time": (
-            workload["think_time"].astype(float) if "think_time" in workload else float("nan")
-        ),
-        "warmup": workload["warmup"].fillna(0).astype(int) if "warmup" in workload else 0,
-    }
-    frame = pd.DataFrame({name: columns[name] for name in REPLAY_COLUMNS})
-    frame = frame.reset_index(drop=True).sort_values("arrived_at", kind="stable")
-    temporary = f"{path}.{os.getpid()}.tmp"
-    frame.to_csv(temporary, index=False)
-    os.replace(temporary, path)
-
-
-def make_simulation_config(
-    spec: WorkloadSpec, seed: int, output_dir: str, log_level: str = "error"
-):
-    """A SimulationConfig built through Frontier's own CLI parser."""
-    from frontier.config import SimulationConfig
-
-    argv = sys.argv
-    sys.argv = ["frontier.main"] + simulation_args(spec, seed, output_dir, log_level)
-    try:
-        return SimulationConfig.create_from_cli_args()
-    finally:
-        sys.argv = argv
-
-
-@contextmanager
-def _working_dir(path: str) -> Iterator[None]:
-    # Frontier resolves data/ and cache/ relative to the working directory
-    previous = os.getcwd()
-    os.chdir(path)
-    try:
-        yield
-    finally:
-        os.chdir(previous)
-
-
-# Building a predictor re-derives its lookup tables from the cached sklearn
-# models: about 50 s for the H200 Llama-2-7B profile, against seconds for the
-# event loop. It depends only on the hardware and engine settings, so it is
-# built once per process for each and handed to every later Simulator, which
-# also keeps its memo of past predictions warm.
-_PREDICTORS: Dict[Tuple, Dict[Any, Any]] = {}
-_WORKLOAD_FIELDS = {
-    "name", "num_requests", "qps", "arrivals", "cv", "length_trace",
-    "prefill_tokens", "decode_tokens", "replay_trace", "replay_time_scale",
-    "session_trace", "session_time_scale", "turn_gap", "session_phase",
-    "session_closed_loop", "session_warmup", "session_concurrency", "session_gap",
-}
-
-
-def _engine_key(spec: WorkloadSpec) -> Tuple:
-    return tuple(
-        (k, tuple(v) if isinstance(v, list) else v)
-        for k, v in sorted(vars(spec).items())
-        if k not in _WORKLOAD_FIELDS
-    )
-
-
-def _round_bits(value: Any, bits: int) -> Any:
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.floating, np.integer)):
-        return value
-    value = float(value)
-    if value == 0.0 or not np.isfinite(value):
-        return value
-    mantissa, exponent = np.frexp(value)
-    return float(np.ldexp(np.round(mantissa * (1 << bits)) / (1 << bits), exponent))
-
-
-def _round_predictor_inputs(predictor: Any, bits: int) -> None:
-    """Round the features of every model lookup, so the memo is reused."""
-    for name in ("_get_prediction_for_features", "_get_on_demand_prediction"):
-        method = getattr(predictor, name, None)
-        if method is None:
-            continue
-
-        def rounded(model_name, features, *args, _method=method, **kwargs):
-            features = {k: _round_bits(v, bits) for k, v in features.items()}
-            return _method(model_name, features, *args, **kwargs)
-
-        setattr(predictor, name, rounded)
-
-
-@contextmanager
-def _shared_predictors(key: Tuple) -> Iterator[None]:
-    from frontier.execution_time_predictor.execution_time_predictor_registry import (
-        ExecutionTimePredictorRegistry,
-    )
-
-    cache = _PREDICTORS.setdefault(key, {})
-    original = ExecutionTimePredictorRegistry.__dict__["get"]
-
-    def get(cls, *args, **kwargs):
-        cluster_type = kwargs.get("cluster_type")
-        if cluster_type not in cache:
-            cache[cluster_type] = original.__func__(cls, *args, **kwargs)
-            bits = dict(key).get("prediction_rounding_bits")
-            if bits is not None:
-                _round_predictor_inputs(cache[cluster_type], bits)
-        predictor = cache[cluster_type]
-        # the only per-Simulator object it holds
-        predictor._cc_backend = kwargs.get("cc_backend", predictor._cc_backend)
-        return predictor
-
-    ExecutionTimePredictorRegistry.get = classmethod(get)
-    try:
-        yield
-    finally:
-        ExecutionTimePredictorRegistry.get = original
-
-
-# bit-identical single-row forest predictions, ~10x faster episodes
-if os.environ.get("FRONTIER_FAST_FOREST", os.environ.get("VIDUR_FRONTIER_FAST_FOREST", "1")) != "0":
-    fast_forest.install()
-
-FRONTIER_ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-# ---------------------------------------------------------------------------
-# agents and episodes
-# ---------------------------------------------------------------------------
-
-
-class BaseAgent:
-    """act(obs) -> (one priority per obs.request_ids entry, info dict)."""
-
-    # oracle baselines may return any int (e.g. a job size); learned policies
-    # are held to [0, num_priority_levels)
-    unbounded_priorities: bool = False
-
-    def act(self, obs: Observation) -> Tuple[Sequence[int], Dict[str, Any]]:
-        raise NotImplementedError
-
-
-class OracleAgent(BaseAgent):
-    """Also sees the true Request objects (output lengths included)."""
-
-    def act_oracle(
-        self,
-        obs: Observation,
-        waiting: List[Request],
-        scheduler: RLVLLMv1EngineReplicaScheduler,
-    ) -> Tuple[Sequence[int], Dict[str, Any]]:
-        raise NotImplementedError
+from frontier.rl.workload import set_workload_seed as _set_workload_seed
 
 
 @dataclass
 class Transition:
-    time: float
     obs: Observation
-    priorities: np.ndarray
+    action: np.ndarray
+    # whatever the agent returned alongside the action (e.g. log_prob, value)
     info: Dict[str, Any]
-    admitted_ids: List[int]
-    boundary_id: Optional[int]
-    reward_components: Dict[str, float] = field(default_factory=dict)
+    time: float
+    num_admitted: int
+    # index of the simulator event during which the decision was made (to replay
+    # or fork the simulation at this decision)
+    event_index: int = -1
+    # [num_requests] whether each waiting request was admitted into the batch
+    admitted: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # index (in obs order) of the first request in ranked order that was not
+    # admitted; None if all were
+    boundary_index: Optional[int] = None
+    # inclusive per-request bounds on the priority that would have produced the
+    # same admission (see action.py); the training log-prob is
+    # Σ_i log P(action_low_i <= a_i <= action_high_i) over obs.rank_mask
+    action_low: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    action_high: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    # filled in at the next decision (or episode end): what accumulated between
+    # this decision and the next one
     reward: float = 0.0
-
-
-@dataclass
-class RequestRecord:
-    id: int
-    arrived_at: float
-    num_prefill_tokens: int
-    num_decode_tokens: int
-    session_id: Optional[int]
-    first_token_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    token_times: List[float] = field(default_factory=list)
-    num_preemptions: int = 0
-    num_cached_prefill_tokens: int = 0
+    reward_components: Dict[str, float] = field(default_factory=zero_components)
+    duration: float = 0.0
 
 
 @dataclass
 class Episode:
-    workload: str
-    seed: int
     transitions: List[Transition]
-    requests: List[RequestRecord]
-    end_time: float
-    # decisions that admitted nothing and were dropped
-    num_dropped_decisions: int
+    # accumulated before the first decision; no action can be credited with it
+    initial_reward_components: Dict[str, float]
+    requests: List[Request]
+    # original output length per request id (Request.restart() rewrites
+    # num_decode_tokens to the number of tokens left)
+    num_decode_tokens: Dict[int, int]
+    # every generated token: time, request id, gap since the request's previous
+    # token (nan for its first token)
+    token_times: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    token_request_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, int))
+    token_gaps: np.ndarray = field(default_factory=lambda: np.zeros(0))
     summary: Dict[str, float] = field(default_factory=dict)
+    # per-request thresholds the rewards used (reference_window mode)
+    request_thresholds: Dict[str, Dict[int, float]] = field(default_factory=dict)
+    # every reward was multiplied by this (1 / baseline cost or gap when normalizing)
+    reward_scale: float = 1.0
+    # unscaled episode cost (Σ weight * component, including what accrued before
+    # the first decision) and the same for the normalization baselines
+    cost: float = float("nan")
+    reference_costs: Dict[str, float] = field(default_factory=dict)
 
     @property
     def total_reward(self) -> float:
-        return float(sum(t.reward for t in self.transitions))
+        return sum(transition.reward for transition in self.transitions)
 
-
-class AgentPriorityPolicy(PriorityPolicy):
-    """Bridges the scheduler hook and an agent, recording transitions."""
-
-    def __init__(self, agent: BaseAgent, num_priority_levels: int, clock) -> None:
-        self._agent = agent
-        self._num_levels = num_priority_levels
-        self._clock = clock
-        self._pending: Optional[Tuple[Transition, List[Request], List[int]]] = None
-        self.transitions: List[Transition] = []
-        self.num_dropped = 0
-        self.records: Dict[int, RequestRecord] = {}
-        # session_concurrency: the calls the episode scores (frontier/rl/scoring.py)
-        self.score_window: Optional[ScoreWindow] = None
-        self._completed: set = set()
-
-    def _record(self, request: Request) -> RequestRecord:
-        record = self.records.get(request.id)
-        if record is None:
-            record = RequestRecord(
-                id=request.id,
-                arrived_at=float(request.arrived_at),
-                num_prefill_tokens=int(request.num_prefill_tokens),
-                num_decode_tokens=int(request.num_decode_tokens),
-                session_id=request.session_id,
-            )
-            self.records[request.id] = record
-        return record
-
-    def get_priorities(self, waiting, scheduler):
-        for request in waiting:
-            self._record(request)
-            if self.score_window is not None:
-                self.score_window.saw(request)
-        if not waiting:
+    @property
+    def normalized_score(self) -> Optional[float]:
+        """
+        (cost_a - cost) / (cost_a - cost_b) for normalize_by_baselines=(a, b),
+        with cost_b = 0 for (a,): 0 = as good as a, 1 = as good as b (or zero
+        cost). None when not normalizing.
+        """
+        if not self.reference_costs:
             return None
-        time = float(self._clock())
-        obs = build_observation(time, waiting, scheduler, self._num_levels)
-        if isinstance(self._agent, OracleAgent):
-            priorities, info = self._agent.act_oracle(obs, waiting, scheduler)
-        else:
-            priorities, info = self._agent.act(obs)
-        priorities = np.asarray(priorities, dtype=np.int64)
-        assert priorities.shape == (len(waiting),)
-        if not self._agent.unbounded_priorities:
-            assert priorities.min() >= 0 and priorities.max() < self._num_levels, (
-                f"priorities must be in [0, {self._num_levels})"
-            )
-        previous = [r.priority for r in waiting]
-        transition = Transition(time, obs, priorities, info, [], None)
-        # a lone request is ranked (its priority orders preemption) but is no
-        # decision (frontier/rl/scheduler.py MIN_WAITING_TO_RECORD)
-        record = len(waiting) >= MIN_WAITING_TO_RECORD
-        self._pending = (transition, list(waiting), previous, record)
-        return priorities
-
-    def on_admission(self, admitted, boundary):
-        if self._pending is None:
-            return
-        transition, waiting, previous, record = self._pending
-        self._pending = None
-        if not admitted:
-            # no effect on admission: undo, so it has no effect on preemption
-            for request, priority in zip(waiting, previous):
-                request.set_priority(priority)
-            if record:
-                self.num_dropped += 1
-            return
-        if not record:
-            return
-        transition.admitted_ids = [r.id for r in admitted]
-        transition.boundary_id = boundary.id if boundary is not None else None
-        self.transitions.append(transition)
-
-    def on_batch_end(self, batch: Batch) -> None:
-        time = float(batch.completed_at)
-        finished = False
-        for request in batch.requests:
-            record = self._record(request)
-            if self.score_window is not None:
-                self.score_window.saw(request)
-            if request.is_prefill_complete:
-                record.token_times.append(time)
-                if record.first_token_at is None:
-                    record.first_token_at = time
-            if request.completed and record.completed_at is None:
-                record.completed_at = float(request.completed_at)
-                record.num_preemptions = int(request.get_total_preemption_count())
-                record.num_cached_prefill_tokens = int(request.num_prefill_tokens_cached)
-                self._completed.add(request.id)
-                finished = True
-        if finished and self.score_window is not None:
-            self.score_window.maybe_stop(self._completed)
+        cost_a, cost_b = (list(self.reference_costs.values()) + [0.0])[:2]
+        if cost_a == cost_b:
+            return float("nan")
+        return (cost_a - self.cost) / (cost_a - cost_b)
 
 
-class FrontierSchedulingEnv:
-    def __init__(
-        self,
-        spec: WorkloadSpec,
-        reward_config: Optional[RewardConfig] = None,
-        num_priority_levels: int = 16,
-        output_dir: str = "/tmp/frontier_rl",
-        log_level: str = "error",
-    ) -> None:
-        self.spec = spec
-        self.reward_config = reward_config or RewardConfig()
-        self.num_priority_levels = num_priority_levels
-        self._output_dir = output_dir
-        # Frontier logs every scheduling step at INFO, about a third of an
-        # episode's time; the config applies --log_level when it is built
-        self._log_level = log_level
+def _act(
+    agent: BaseAgent,
+    obs: Observation,
+    waiting_requests: List[Request],
+    scheduler,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    if isinstance(agent, OracleAgent):
+        priorities, info = agent.act_oracle(obs, waiting_requests, scheduler)
+    else:
+        priorities, info = agent.act(obs)
+    return np.asarray(priorities, dtype=np.int64), info
 
-    def run_stock(self, seed: int = 0):
-        """Stock Frontier (no RL scheduler, no policy) on the same workload; returns the Simulator."""
-        from frontier.utils.random import set_seeds
-
-        with _working_dir(FRONTIER_ROOT):
-            config = make_simulation_config(self.spec, seed, self._output_dir, self._log_level)
-            set_seeds(seed)
-            simulator = _RLSimulator(config)
-            simulator.run()
-        return simulator
-
-    def make_simulator(self, seed: int, reuse_predictor: bool = True):
-        from frontier.utils.random import set_seeds
-
-        config = make_simulation_config(self.spec, seed, self._output_dir, self._log_level)
-        set_seeds(seed)
-        with rl_scheduler_installed():
-            if reuse_predictor:
-                with _shared_predictors(_engine_key(self.spec)):
-                    simulator = _RLSimulator(config)
-            else:
-                simulator = _RLSimulator(config)
-        return simulator
-
-    def run_episode(self, agent: BaseAgent, seed: int = 0) -> Episode:
-        """
-        One episode. Session workloads score as frontier/rl/sched's FrontierEnv
-        does: with session_concurrency, each agent's quota after the warm-up
-        (scoring.ScoreWindow, the simulation stops once they finish);
-        otherwise every call but session_warmup's warm-up calls. Unscored calls
-        are simulated (they keep the server loaded and its cache warm) but left
-        out of requests, rewards and the summary, as are decisions before the
-        first scored call arrives.
-        """
-        import pandas as pd
-
-        frame = None
-        if self.spec.arrivals == "sessions":
-            frame = pd.read_csv(
-                session_workload_trace(self.spec, seed, self._output_dir),
-                usecols=lambda c: c in ("session_id", "warmup"),
-            )
-        with _working_dir(FRONTIER_ROOT):
-            # request ids are trace rows, as in frontier/rl/sched, so calls
-            # match across episodes and stacks
-            Request._id = -1
-            simulator = self.make_simulator(seed)
-            policy = AgentPriorityPolicy(
-                agent, self.num_priority_levels, clock=lambda: simulator._time
-            )
-            schedulers = replica_schedulers(simulator)
-            assert len(schedulers) == 1, "the env drives a single replica"
-            schedulers[0].set_priority_policy(policy)
-            if self.spec.session_concurrency:
-                # agents = slots actually sampled (synthetic scales the count)
-                policy.score_window = ScoreWindow.for_workload(
-                    simulator,
-                    self.spec.session_warmup,
-                    self.spec.num_requests,
-                    int(frame["session_id"].nunique()),
-                )
-            simulator.run()
-        self.last_simulator = simulator
-
-        requests = sorted(policy.records.values(), key=lambda r: r.id)
-        transitions = policy.transitions
-        scored = None
-        if policy.score_window is not None:
-            scored = policy.score_window.final_ids()
-        elif frame is not None and "warmup" in frame and frame["warmup"].any():
-            warmup = set(np.flatnonzero(frame["warmup"].to_numpy() > 0).tolist())
-            scored = {r.id for r in requests} - warmup
-        if scored is not None:
-            assert scored, "every call is warm-up"
-            requests = [r for r in requests if r.id in scored]
-            start = min(r.arrived_at for r in requests)
-            transitions = [t for t in transitions if t.time >= start]
-        episode = Episode(
-            workload=self.spec.name,
-            seed=seed,
-            transitions=transitions,
-            requests=requests,
-            end_time=float(simulator._time),
-            num_dropped_decisions=policy.num_dropped,
-        )
-        components = transition_components(episode, self.reward_config)
-        for transition, values in zip(episode.transitions, components):
-            transition.reward_components = values
-            transition.reward = self.reward_config.combine(values)
-        episode.summary = summarize(episode)
-        return episode
-
-
-class _RLSimulator(Simulator):
-    """Frontier's simulator without the end-of-run metric dump."""
-
-    def _write_output(self) -> None:
-        pass
 
 
 def _quantile(values: np.ndarray, q: float) -> float:
     return float(np.quantile(values, q)) if len(values) else float("nan")
 
 
-def summarize(episode: Episode) -> Dict[str, float]:
-    done = [r for r in episode.requests if r.completed_at is not None]
-    e2e = np.array([r.completed_at - r.arrived_at for r in done])
-    ttft = np.array(
-        [r.first_token_at - r.arrived_at for r in done if r.first_token_at is not None]
+def _summarize(episode: Episode, end_time: float) -> Dict[str, float]:
+    requests = episode.requests
+    num_decode_tokens = episode.num_decode_tokens
+    completed = [request for request in requests if request.completed]
+    samples = episode_metric_samples(episode)
+    e2e, ttft, tbt = samples["e2e"], samples["ttft"], samples["tbt"]
+    e2e_normalized = np.array(
+        [(r.completed_at - r.arrived_at) / num_decode_tokens[r.id] for r in completed]
     )
-    gaps = np.concatenate(
-        [np.diff(r.token_times) for r in done if len(r.token_times) > 1] or [np.array([])]
-    )
-    out = {
-        "num_requests": len(episode.requests),
-        "num_completed": len(done),
+
+    def mean(values: np.ndarray) -> float:
+        return float(np.mean(values)) if len(values) else float("nan")
+
+    return {
+        "num_requests": len(requests),
+        "num_completed": len(completed),
         "num_decisions": len(episode.transitions),
-        "num_dropped_decisions": episode.num_dropped_decisions,
-        "end_time": episode.end_time,
-        "total_reward": episode.total_reward,
-        "num_preemptions": int(sum(r.num_preemptions for r in done)),
-        "cached_prefill_fraction": (
-            sum(r.num_cached_prefill_tokens for r in done)
-            / max(1, sum(r.num_prefill_tokens for r in done))
+        "total_reward": float(episode.total_reward),
+        "end_time": float(end_time),
+        "mean_e2e": mean(e2e),
+        "p50_e2e": _quantile(e2e, 0.5),
+        "p95_e2e": _quantile(e2e, 0.95),
+        "p99_e2e": _quantile(e2e, 0.99),
+        "max_e2e": float(np.max(e2e)) if len(e2e) else float("nan"),
+        "mean_e2e_normalized": mean(e2e_normalized),
+        "p95_e2e_normalized": _quantile(e2e_normalized, 0.95),
+        "p99_e2e_normalized": _quantile(e2e_normalized, 0.99),
+        "mean_ttft": mean(ttft),
+        "p95_ttft": _quantile(ttft, 0.95),
+        "p99_ttft": _quantile(ttft, 0.99),
+        "mean_tbt": mean(tbt),
+        "p95_tbt": _quantile(tbt, 0.95),
+        "p99_tbt": _quantile(tbt, 0.99),
+        "output_tokens_per_s": (
+            sum(num_decode_tokens[r.id] for r in completed) / end_time
+            if end_time > 0
+            else float("nan")
         ),
+        "num_restarts": int(sum(r.num_restarts for r in requests)),
     }
-    for name, values in (("e2e", e2e), ("ttft", ttft), ("tbt", gaps)):
-        out[f"mean_{name}"] = float(values.mean()) if len(values) else float("nan")
-        for q in (0.5, 0.95, 0.99):
-            out[f"p{int(q * 100)}_{name}"] = _quantile(values, q)
-        out[f"max_{name}"] = float(values.max()) if len(values) else float("nan")
-    return out
+
+
+
+class SchedulingEnv:
+    """
+    Reference runs, reward context and threshold calibration for an
+    environment whose run_episode(agent, workload_seed, request_generator_config,
+    reward_config) simulates one episode (FrontierEnv). Subclasses set
+    _config, _reward_config, _observation_config and _reference_episodes.
+
+    The workload (arrival times, request lengths) is fully determined by
+    workload_seed, so several rollouts on the same seed differ only through the
+    agent's own sampling.
+    """
+
+    @property
+    def config(self) -> SimulationConfig:
+        return self._config
+
+    @property
+    def reward_config(self) -> RewardConfig:
+        return self._reward_config
+
+    @property
+    def observation_config(self) -> ObservationConfig:
+        return self._observation_config
+
+    def reference_episode(
+        self,
+        baseline: str,
+        workload_seed: Optional[int] = None,
+        request_generator_config: Optional[Any] = None,
+    ) -> Episode:
+        """
+        A baseline's episode on this workload (see agents.baseline_agent),
+        cached. Baselines do not depend on the reward, so the cached run can be
+        rescored under any reward config with episode_cost().
+        """
+        key = (baseline, workload_seed, repr(request_generator_config))
+        if key not in self._reference_episodes:
+            # a plain reward config, so building it needs no reference runs
+            self._reference_episodes[key] = self.run_episode(
+                baseline_agent(baseline, seed=workload_seed),
+                workload_seed,
+                request_generator_config,
+                reward_config=RewardConfig(),
+            )
+        return self._reference_episodes[key]
+
+    def reward_context(
+        self,
+        reward_config: RewardConfig,
+        workload_seed: Optional[int] = None,
+        request_generator_config: Optional[Any] = None,
+    ) -> RewardContext:
+        """Per-request thresholds and reward scale for this workload."""
+        context = RewardContext()
+        if reward_config.window_thresholds:
+            reference = self.reference_episode(
+                reward_config.threshold_reference,
+                workload_seed,
+                request_generator_config,
+            )
+            context.request_thresholds = window_thresholds(reference, reward_config)
+        if reward_config.weights.get("ttft_ref_sq"):
+            reference = self.reference_episode(
+                reward_config.threshold_reference,
+                workload_seed,
+                request_generator_config,
+            )
+            context.request_thresholds[TTFT_REF_THRESHOLD] = reference_ttft_thresholds(
+                reference, reward_config
+            )
+
+        if reward_config.normalize_by_baselines is not None:
+            for baseline in reward_config.normalize_by_baselines:
+                reference = self.reference_episode(
+                    baseline, workload_seed, request_generator_config
+                )
+                context.reference_costs[baseline] = episode_cost(
+                    reference, reward_config, context.request_thresholds
+                )
+            cost_a, cost_b = (list(context.reference_costs.values()) + [0.0])[:2]
+            gap = max(
+                abs(cost_a - cost_b),
+                reward_config.normalization_min_fraction * abs(cost_a),
+                1e-9,
+            )
+            context.scale = 1.0 / gap
+        return context
+
+    def mean_gap_closed(
+        self,
+        episode: Episode,
+        workload_seed: Optional[int] = None,
+        request_generator_config: Optional[Any] = None,
+        mean_term: str = "e2e_normalized",
+        reference: Optional[str] = None,
+    ) -> float:
+        """
+        Evaluation metric, not a reward: the fraction of the FCFS-to-SJF gain on
+        one mean-latency component that the episode achieved,
+            (M_fcfs - M) / (M_fcfs - M_sjf)
+        0 = FCFS, 1 = oracle SJF, > 1 = better than SJF (possible: SJF is not
+        optimal under continuous batching). The episode must be from the given
+        workload. reference defaults to MEAN_COMPONENT_REFERENCES[mean_term].
+        Tails are reported separately, against FCFS.
+        """
+        reference = reference or MEAN_COMPONENT_REFERENCES[mean_term]
+        config = RewardConfig(weights={mean_term: 1.0})
+
+        def mean_cost(e: Episode) -> float:
+            return episode_cost_components(e, config, {})[mean_term]
+
+        cost_fcfs, cost_sjf = (
+            mean_cost(
+                self.reference_episode(name, workload_seed, request_generator_config)
+            )
+            for name in ("fcfs", reference)
+        )
+        if cost_fcfs == cost_sjf:
+            return float("nan")
+        return (cost_fcfs - mean_cost(episode)) / (cost_fcfs - cost_sjf)
+
+    def calibrate_thresholds(self, reward_config: RewardConfig) -> RewardConfig:
+        """
+        Fill the thresholds left as None with calibration_quantile of their
+        metric over FCFS episodes on calibration_seeds. Fixed thresholds keep the
+        reward stationary while the policy learns. In reference_window mode only
+        tbt_slo is calibrated here; the rest are set per workload.
+        """
+        samples: Dict[str, List[np.ndarray]] = {"ttft": [], "e2e": [], "tbt": []}
+        for seed in reward_config.calibration_seeds:
+            episode = self.run_episode(
+                FCFSAgent(), workload_seed=seed, reward_config=RewardConfig()
+            )
+            for metric, values in episode_metric_samples(episode).items():
+                samples[metric].append(values)
+
+        q = reward_config.calibration_quantile
+        updates = {
+            name: _quantile(np.concatenate(samples[metric]), q)
+            for name, metric in THRESHOLD_METRICS.items()
+            if getattr(reward_config, name) is None
+            and name not in reward_config.window_thresholds
+        }
+        return dataclasses.replace(reward_config, **updates)

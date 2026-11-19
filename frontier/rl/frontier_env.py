@@ -11,7 +11,7 @@ built the way the stack's Vidur version built it:
 - Requests come from the request generators in workload.py (Vidur's, copied)
   for the workload seed, written to a CSV and replayed by Frontier, with
   request ids 0..N-1 in arrival order.
-- Observations are the frontier/rl/sched/features.py features, computed from Frontier's
+- Observations are the frontier/rl/features.py features, computed from Frontier's
   scheduler state; FrontierFeatureScheduler keeps the request histories and
   sliding windows that RLVLLMReplicaScheduler keeps.
 - Every waiting queue is ranked, but only rankings of at least 2 requests are
@@ -19,7 +19,7 @@ built the way the stack's Vidur version built it:
   a ranking that admitted nothing is undone and dropped, and each kept ranking
   gets admission action bounds.
 - Rewards are computed after the episode from request and token timings with
-  frontier/rl/sched/reward.py, which gives the numbers its online RewardTracker would.
+  frontier/rl/reward.py, which gives the numbers its online RewardTracker would.
 
 What stays Frontier's: batch timing (its profiled predictors, CPU overhead),
 admission and preemption. Two of those differ from Vidur's scheduler: vLLM
@@ -28,7 +28,7 @@ priority mode it preempts the running request with the largest (priority,
 arrival), so a request's priority still matters after admission (Vidur
 preempts the most recently admitted one).
 
-Importing frontier/rl/env.py (which this module does) swaps sklearn's
+Importing frontier/rl/engine.py (which this module does) swaps sklearn's
 single-row forest prediction for frontier/rl/fast_forest.py (bit-identical,
 ~10x faster episodes); set FRONTIER_FAST_FOREST=0 to keep sklearn's.
 """
@@ -45,9 +45,9 @@ from typing import Any, Dict, Iterator, List, Optional
 import numpy as np
 import pandas as pd
 
-from frontier.rl.sched.action import admission_action_bounds
-from frontier.rl.sched.agents import BaseAgent, OracleAgent
-from frontier.rl.sched.env import (
+from frontier.rl.action import admission_action_bounds
+from frontier.rl.agents import BaseAgent, OracleAgent
+from frontier.rl.env import (
     Episode,
     SchedulingEnv,
     Transition,
@@ -55,27 +55,27 @@ from frontier.rl.sched.env import (
     _set_workload_seed,
     _summarize,
 )
-from frontier.rl.sched.history import (
+from frontier.rl.history import (
     WINDOW_METRICS,
     WINDOW_SIZES,
     RequestHistory,
     SlidingWindow,
 )
-from frontier.rl.sched.observation import ObservationConfig, build_observation
-from frontier.rl.sched.reward import (
+from frontier.rl.observation import ObservationConfig, build_observation
+from frontier.rl.reward import (
     RewardConfig,
     episode_cost,
     per_request_reward_components,
     zero_components,
 )
-from frontier.rl.sched.workload import (
+from frontier.rl.workload import (
     SimulationConfig,
     generate_requests,
     vidur_num_blocks,
 )
 
 from frontier.entities import Request as FrontierRequest
-from frontier.rl.env import (
+from frontier.rl.engine import (
     FRONTIER_ROOT,
     PRESETS,
     WorkloadSpec,
@@ -84,8 +84,8 @@ from frontier.rl.env import (
     _shared_predictors,
     _working_dir,
 )
-from frontier.rl.env import make_simulation_config as frontier_config
-from frontier.rl.observation import prefill_target_tokens, prefix_cache_view
+from frontier.rl.engine import make_simulation_config as frontier_config
+from frontier.rl.prefix_cache import prefill_target_tokens, prefix_cache_view
 from frontier.rl.scoring import ScoreWindow
 from frontier.rl.scheduler import (
     MIN_WAITING_TO_RECORD,
@@ -99,7 +99,7 @@ from frontier.scheduler.replica_scheduler.replica_scheduler_registry import (
 from frontier.types import ReplicaSchedulerType
 from frontier.utils.random import set_seeds
 
-# WorkloadSpec fields (frontier/rl/env.py) a workload's `frontier` dict can set.
+# WorkloadSpec fields (frontier/rl/engine.py) a workload's `frontier` dict can set.
 # Llama-2-7B on H200 is the dense model Frontier has full profiles for (mixed
 # and chunked-prefill attention, CPU overhead).
 FRONTIER_DEFAULTS: Dict[str, Any] = {
@@ -120,8 +120,8 @@ _NOT_FROM_PRESET = ("name", "max_tokens", "max_tokens_in_batch", "batch_size_cap
 
 def frontier_settings(frontier: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """WorkloadSpec settings of a workload's `frontier` dict: FRONTIER_DEFAULTS,
-    then the engine settings of `preset` (frontier/rl/env.py PRESETS, the ones
-    FrontierSchedulingEnv uses), then the dict's own keys."""
+    then the engine settings of `preset` (frontier/rl/engine.py PRESETS), then
+    the dict's own keys."""
     frontier = dict(frontier or {})
     preset = frontier.pop("preset", None)
     settings = dict(FRONTIER_DEFAULTS)
@@ -215,7 +215,7 @@ def _feature_scheduler_installed() -> Iterator[None]:
 
 @dataclass
 class _RequestView:
-    """The Vidur Request attributes frontier/rl/sched/features.py reads."""
+    """The Vidur Request attributes frontier/rl/features.py reads."""
 
     id: int
     arrived_at: float
@@ -265,8 +265,7 @@ def _view(
 
 class _OracleRequest:
     """A waiting Frontier request as the SJF baselines (history.job_size) see
-    it, in the terms of the size both RL stacks share
-    (frontier/rl/observation.py job_size_tokens): num_prefill_tokens is what
+    it: num_prefill_tokens is what
     admission must compute (for a victim preempted after prefill, prompt plus
     kept output), num_cached_prefill_tokens what the prefix cache holds of it
     now, num_decode_tokens the output still to generate."""
@@ -282,7 +281,7 @@ class _OracleRequest:
 
 
 class _SchedulerView:
-    """What frontier/rl/sched/observation.py, features.py and the baselines read from
+    """What observation.py, features.py and the baselines read from
     RLVLLMReplicaScheduler, from a FrontierFeatureScheduler."""
 
     tie_break = "arrival"
@@ -498,7 +497,7 @@ class _BridgePolicy(PriorityPolicy):
 
 @dataclass
 class RequestRecord:
-    """The Vidur Request attributes frontier/rl/sched/reward.py and env.py read."""
+    """The Vidur Request attributes frontier/rl/reward.py and env.py read."""
 
     id: int
     arrived_at: float

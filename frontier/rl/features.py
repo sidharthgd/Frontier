@@ -20,11 +20,11 @@ from typing import TYPE_CHECKING, Callable, Dict, List
 import numpy as np
 
 from frontier.entities import Request
-from frontier.rl.sched.history import WINDOW_METRICS, WINDOW_SIZES, RequestHistory
+from frontier.rl.history import WINDOW_METRICS, WINDOW_SIZES, RequestHistory
 
 if TYPE_CHECKING:
     # the scheduler the features read (frontier_env._SchedulerView)
-    from frontier.rl.sched.frontier_env import _SchedulerView as RLVLLMReplicaScheduler
+    from frontier.rl.frontier_env import _SchedulerView as RLVLLMReplicaScheduler
 
 
 @dataclass
@@ -140,7 +140,7 @@ def _blocks_needed_over_free(ctx):
 # the leading prompt blocks whose chained hashes are in the cache now, capped
 # so at least the last prompt token is computed
 # (KVCacheManager.peek_prefix_cache, set on the request view by
-# frontier/rl/sched/frontier_env.py). On a real server this is the lookup
+# frontier/rl/frontier_env.py). On a real server this is the lookup
 # get_computed_blocks already does for the head of the queue; done for every
 # waiting request it is one dict lookup per block (or O(log blocks) with a
 # binary search over the hash chain, since LRU eviction of tail-first freed

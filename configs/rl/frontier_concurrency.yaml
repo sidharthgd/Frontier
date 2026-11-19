@@ -5,7 +5,7 @@
 # Workloads: session_concurrency N simulated agents, each running sessions
 # back to back (next call after the previous response + think time). 600 s
 # of warm-up, then each agent's first ceil(num_requests / N) calls are scored
-# and the episode stops once they finish (frontier/rl/sched/frontier_env.py), so a
+# and the episode stops once they finish (frontier/rl/frontier_env.py), so a
 # policy that starves an agent cannot shrink that agent's share of the score.
 # Train: synthetic:random, base 18 agents x a 0.5-2x load draw (9-36 agents;
 # FCFS mean TTFT 1-200 s over 8 seeds). Eval: TraceLab / FreeInference at 12
@@ -46,8 +46,8 @@ workloads:
     session_warmup: 600
   backend: frontier
   frontier: &frontier
-    # A100 + Llama-3.1-8B as validated against vLLM (frontier/rl/env.py
-    # a100_llama31_8b, also FrontierSchedulingEnv's): piecewise CUDA graphs,
+    # A100 + Llama-3.1-8B as validated against vLLM (frontier/rl/engine.py
+    # a100_llama31_8b): piecewise CUDA graphs,
     # 128k context, no CPU-overhead tables. Runs before 2026-11-19
     # (rl_runs/frontier_concurrency{,_ppo}) had decode CUDA graphs off.
     preset: a100_llama31_8b

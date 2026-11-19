@@ -1,8 +1,7 @@
 """
 Which calls an episode scores on a closed-loop agent workload
-(session_concurrency: N agents running sessions back to back), shared by
-FrontierSchedulingEnv (env.py) and the training stack's FrontierEnv
-(sched/frontier_env.py):
+(session_concurrency: N agents running sessions back to back), as
+frontier_env.FrontierEnv applies it:
 
 - warm-up: calls arriving before warmup_s are simulated, so the server's
   queue and prefix cache are warm, but not scored;

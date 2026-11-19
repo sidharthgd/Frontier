@@ -2,9 +2,9 @@
 Build request-length traces from chat datasets, as used by Fu et al.,
 "Efficient LLM Scheduling by Learning to Rank" (arXiv 2408.15792):
 
-    python frontier/rl/sched/prepare_traces.py sharegpt ShareGPT_V3_unfiltered_cleaned_split.json
-    python frontier/rl/sched/prepare_traces.py lmsys path/to/lmsys-chat-1m/data/
-    python frontier/rl/sched/prepare_traces.py azure AzureLLMInferenceTrace_conv.csv
+    python frontier/rl/prepare_traces.py sharegpt ShareGPT_V3_unfiltered_cleaned_split.json
+    python frontier/rl/prepare_traces.py lmsys path/to/lmsys-chat-1m/data/
+    python frontier/rl/prepare_traces.py azure AzureLLMInferenceTrace_conv.csv
 
 Run it as a file: it imports nothing from this repo, so it works from a separate
 environment with `tokenizers`, `pandas` and `pyarrow` (lmsys only), none of

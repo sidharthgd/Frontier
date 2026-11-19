@@ -18,7 +18,7 @@ stick to a request until the policy changes them.
 """
 
 from contextlib import contextmanager
-from typing import Callable, Iterator, List, Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 from frontier.entities import Batch, Request
 from frontier.scheduler.replica_scheduler.replica_scheduler_registry import (
@@ -77,8 +77,7 @@ class _FreeOrder:
         return total
 
 
-# How both RL environments use the hook (frontier/rl/env.py and
-# frontier/rl/sched/frontier_env.py): every non-empty waiting queue gets
+# How the RL environment (frontier/rl/frontier_env.py) uses the hook: every non-empty waiting queue gets
 # priorities, even a single request, because a priority outlives admission:
 # priority-mode preemption evicts the running request with the largest
 # (priority, arrival), and a request never ranked keeps the default 0, which
@@ -118,8 +117,6 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
         super().__init__(*args, **kwargs)
         self._priority_policy: Optional[PriorityPolicy] = None
         self._ranked_waiting: List[Request] = []
-        # called with each request that finishes, after the batch ends
-        self.completion_listeners: List[Callable[[Request], None]] = []
 
     def set_priority_policy(self, policy: Optional[PriorityPolicy]) -> None:
         if policy is not None:
@@ -269,11 +266,6 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
         super().on_batch_end(batch)
         if self._priority_policy is not None:
             self._priority_policy.on_batch_end(batch)
-        if self.completion_listeners:
-            for request in batch.requests:
-                if request.completed:
-                    for listener in self.completion_listeners:
-                        listener(request)
 
 
 @contextmanager

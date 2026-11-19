@@ -2,8 +2,8 @@
 Evaluate a trained policy against baselines on held-out seeds
 (docs/rl_plan.md §6 step 8):
 
-    python -m frontier.rl.sched.evaluate --checkpoint rl_runs/ppo_default/best.pt
-    python -m frontier.rl.sched.evaluate --checkpoint ... --seeds 2000000 2000001 \\
+    python -m frontier.rl.evaluate --checkpoint rl_runs/ppo_default/best.pt
+    python -m frontier.rl.evaluate --checkpoint ... --seeds 2000000 2000001 \\
         --workload '{name: qps15, qps: 15, num_blocks: 6000}'
 
 For each workload and seed it runs the policy with each decoding in
@@ -19,10 +19,10 @@ from typing import Dict, List, Sequence
 import pandas as pd
 import yaml
 
-from frontier.rl.sched.reward import episode_cost
-from frontier.rl.sched.rollout import RolloutRunner, RolloutTask, WorkloadConfig
-from frontier.rl.sched.torch_agent import DECODINGS
-from frontier.rl.sched.train import TrainConfig, load_checkpoint
+from frontier.rl.reward import episode_cost
+from frontier.rl.rollout import RolloutRunner, RolloutTask, WorkloadConfig
+from frontier.rl.torch_agent import DECODINGS
+from frontier.rl.train import TrainConfig, load_checkpoint
 
 DEFAULT_BASELINES = (
     "fcfs",

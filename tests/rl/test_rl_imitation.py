@@ -1,9 +1,9 @@
 """
-Checks for imitation learning from an oracle teacher (frontier/rl/sched/teacher.py,
+Checks for imitation learning from an oracle teacher (frontier/rl/teacher.py,
 imitation.py) and PPO fine-tuning from it.
 
 Run from the repo root (so ./data and ./cache resolve):
-    python -m pytest tests/rl/sched/test_rl_imitation.py -v
+    python -m pytest tests/rl/test_rl_imitation.py -v
 """
 
 import json
@@ -12,15 +12,16 @@ import numpy as np
 import pytest
 import torch
 
-from frontier.rl.sched import ObservationConfig, RewardConfig
-from frontier.rl.sched.env import Transition
-from frontier.rl.sched.evaluate import evaluate
-from frontier.rl.sched.imitation import ImitationConfig, ImitationTrainer
-from frontier.rl.sched.model import PriorityDistribution, SchedulerModel, config_for
-from frontier.rl.sched.observation import Observation
-from frontier.rl.sched.ppo import PPOConfig, RunningStd, ppo_update
-from frontier.rl.sched.rollout import RolloutCollector, RolloutTask, WorkloadConfig
-from frontier.rl.sched.teacher import (
+from frontier.rl.observation import ObservationConfig
+from frontier.rl.reward import RewardConfig
+from frontier.rl.env import Transition
+from frontier.rl.evaluate import evaluate
+from frontier.rl.imitation import ImitationConfig, ImitationTrainer
+from frontier.rl.model import PriorityDistribution, SchedulerModel, config_for
+from frontier.rl.observation import Observation
+from frontier.rl.ppo import PPOConfig, RunningStd, ppo_update
+from frontier.rl.rollout import RolloutCollector, RolloutTask, WorkloadConfig
+from frontier.rl.teacher import (
     ACTED_BY_TEACHER,
     TEACHER_LEVEL,
     TEACHER_RANK,
@@ -29,8 +30,8 @@ from frontier.rl.sched.teacher import (
     imitation_losses,
     make_teacher,
 )
-from frontier.rl.sched.train import Trainer, load_config
-from frontier.rl.sched.history import job_size
+from frontier.rl.train import Trainer, load_config
+from frontier.rl.history import job_size
 
 from test_rl_components import OutputLengthGuard
 
@@ -192,7 +193,7 @@ def test_dagger_then_finetune_smoke(tmp_path):
     imitation_dir, ppo_dir = tmp_path / "imitation", tmp_path / "ppo"
     common = [TINY, "num_workers=0", "eval_seeds=[1000000]"]
     config = load_config(
-        "tests/rl/sched/imitation_smoke.yaml",
+        "tests/rl/imitation_smoke.yaml",
         common
         + [
             "imitation.iterations=2",
@@ -235,7 +236,7 @@ def test_dagger_then_finetune_smoke(tmp_path):
     assert np.isfinite(table["improvement_over_fcfs"]).all()
 
     config = load_config(
-        "tests/rl/sched/imitation_smoke.yaml",
+        "tests/rl/imitation_smoke.yaml",
         common
         + [
             "iterations=1",

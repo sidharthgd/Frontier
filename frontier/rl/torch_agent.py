@@ -4,9 +4,9 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from frontier.rl.sched.agents import BaseAgent
-from frontier.rl.sched.model import SchedulerModel, collate, full_actions, modeled_indices
-from frontier.rl.sched.observation import Observation
+from frontier.rl.agents import BaseAgent
+from frontier.rl.model import SchedulerModel, collate, full_actions, modeled_indices
+from frontier.rl.observation import Observation
 
 DECODINGS = ("sample", "argmax", "rank")
 

@@ -16,17 +16,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from frontier.rl.sched.env import Transition, make_simulation_config
-from frontier.rl.sched.frontier_env import FrontierEnv
-from frontier.rl.sched.model import ModelConfig, SchedulerModel
-from frontier.rl.sched.observation import ObservationConfig
-from frontier.rl.sched.reward import (
+from frontier.rl.env import Transition, make_simulation_config
+from frontier.rl.frontier_env import FrontierEnv
+from frontier.rl.model import ModelConfig, SchedulerModel
+from frontier.rl.observation import ObservationConfig
+from frontier.rl.reward import (
     RewardConfig,
     episode_cost,
     per_request_rewards,
 )
-from frontier.rl.sched.teacher import ImitationAgent, make_teacher
-from frontier.rl.sched.torch_agent import TorchAgent, mean_decision_time
+from frontier.rl.teacher import ImitationAgent, make_teacher
+from frontier.rl.torch_agent import TorchAgent, mean_decision_time
 
 
 @dataclass
@@ -39,12 +39,12 @@ class WorkloadConfig:
     num_blocks: Optional[int] = None
     num_requests: int = 300
     weight: float = 1.0
-    # a TRACE_FILES name (frontier/rl/sched/env.py) or a path
+    # a TRACE_FILES name (frontier/rl/env.py) or a path
     trace: str = "azure_conv"
     # "poisson", or "trace" to replay seed-picked windows of real arrivals
     arrivals: str = "poisson"
     simulation: Dict[str, Any] = field(default_factory=dict)
-    # episodes run in Frontier (frontier/rl/sched/frontier_env.py) with the
+    # episodes run in Frontier (frontier/rl/frontier_env.py) with the
     # `frontier` settings; "frontier" is the only backend (the Vidur
     # simulator one stayed in the Vidur repo), kept so configs load unchanged
     backend: str = "frontier"
@@ -89,7 +89,7 @@ class RolloutTask:
     agent_seed: int
     # TorchAgent decoding: "sample" (training), "argmax" or "rank"
     decoding: str = "sample"
-    # oracle teacher (frontier/rl/sched/teacher.py): record its ranking at every
+    # oracle teacher (frontier/rl/teacher.py): record its ranking at every
     # decision, and act with it with probability teacher_mix (DAgger)
     teacher: Optional[str] = None
     teacher_mix: float = 0.0

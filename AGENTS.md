@@ -144,8 +144,8 @@ Core `frontier/` subpackages (high-level):
 - `frontier/profiling/`: utilities for collecting profiling data
 - `frontier/spec_decode/`: speculative decoding / MTP helpers and runtime contracts
 - `frontier/rl/`: RL scheduling on the vLLM v1 scheduler: the priority hook (`scheduler.py`),
-  `FrontierSchedulingEnv` (`env.py`), and `frontier/rl/sched/`, the imitation + PPO training
-  stack (ported from Vidur; configs in `configs/rl/`, experiment scripts in `scripts/rl/`)
+  the environment (`frontier_env.py`) and the imitation + PPO training stack (ported from
+  Vidur; configs in `configs/rl/`, experiment scripts in `scripts/rl/`)
 - `frontier/trace_prep/`: session traces with prefix-cache block hash ids, and workload samplers
 
 Entry points:
@@ -153,8 +153,8 @@ Entry points:
 - `python -m frontier.main`: run a simulation
 - `python -m frontier.training`: train prediction models
 - `python -m frontier.training.cli`: train prediction models
-- `python -m frontier.rl.sched.imitation` / `python -m frontier.rl.sched.train --config configs/rl/<name>.yaml`:
-  train a scheduling policy (`frontier/rl/sched/__init__.py`)
+- `python -m frontier.rl.imitation` / `python -m frontier.rl.train --config configs/rl/<name>.yaml`:
+  train a scheduling policy (`frontier/rl/__init__.py`)
 
 ## User Guides
 

@@ -29,15 +29,15 @@ import torch
 import torch.nn.functional as F
 
 from frontier.entities import Request
-from frontier.rl.sched.agents import (
+from frontier.rl.agents import (
     BaseAgent,
     OracleAgent,
     OracleSJFAgent,
     baseline_agent,
     bucket_ranks,
 )
-from frontier.rl.sched.model import PriorityDistribution
-from frontier.rl.sched.observation import Observation
+from frontier.rl.model import PriorityDistribution
+from frontier.rl.observation import Observation
 
 TEACHER_RANK = "teacher_rank"
 TEACHER_LEVEL = "teacher_level"

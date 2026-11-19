@@ -1,9 +1,9 @@
 # Imitation of uncached-prompt aging SJF, then PPO fine-tuning, on Frontier with
 # the frontier_synthetic.yaml workloads (train synthetic:random, eval on real
 # TraceLab / FreeInference traces):
-#   .venv/bin/python -m frontier.rl.sched.imitation \
+#   .venv/bin/python -m frontier.rl.imitation \
 #       --config configs/rl/frontier_imitation.yaml
-#   .venv/bin/python -m frontier.rl.sched.train \
+#   .venv/bin/python -m frontier.rl.train \
 #       --config configs/rl/frontier_imitation.yaml \
 #       --set init_checkpoint=rl_runs/frontier_imitation/best.pt \
 #       --set output_dir=rl_runs/frontier_imitation_ppo
