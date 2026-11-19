@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from frontier.entities.batch import Request
 from frontier.kv_cache.base_kv_cache_manager import KVCacheAllocationResult
 from frontier.kv_cache.kv_cache_block import KVCacheBlock, KVCacheBlockBinding
+from frontier.scheduler.replica_scheduler import vllm_v1_decision_log
 from frontier.scheduler.replica_scheduler.vllm_v1_decision_log import (
     _log_frontier_vllm_v1_schedule_decision,
 )
@@ -80,6 +81,33 @@ def _consistent_hit_bindings(
     if hashes != query_hashes[: len(hashes)] or len(hashes) > len(query_hashes):
         return None
     return bindings
+
+
+def _decision_log_discards_events() -> bool:
+    """Whether _log_frontier_vllm_v1_schedule_decision, as this module calls
+    it, drops every event: it is the decision log's own function and no log
+    path is configured. (A test that patches it in gets every event.)"""
+    return (
+        _log_frontier_vllm_v1_schedule_decision
+        is vllm_v1_decision_log._log_frontier_vllm_v1_schedule_decision
+        and not vllm_v1_decision_log.schedule_decision_logging_enabled()
+    )
+
+
+def _hit_bindings_may_disagree(
+    bindings: Sequence[KVCacheBlockBinding], query_hashes: list
+) -> bool:
+    """False when _serialize_prefix_cache_hit_bindings's checks pass for
+    these bindings (more bindings than queries, or a binding whose hash
+    differs from its query's), by one list comparison, as in
+    _consistent_hit_bindings."""
+    if len(bindings) > len(query_hashes):
+        return True
+    try:
+        hashes = [binding.block_hash for binding in bindings]
+    except AttributeError:
+        return True
+    return hashes != query_hashes[: len(hashes)]
 
 
 class PrefixCacheLedger:
@@ -234,6 +262,14 @@ class PrefixCacheLedger:
         allocation: KVCacheAllocationResult,
         admission: Optional[PrefixCacheAdmission],
     ) -> None:
+        if _decision_log_discards_events():
+            self._check_prefix_cache_identity_events(
+                request=request,
+                num_new_tokens=num_new_tokens,
+                allocation=allocation,
+                admission=admission,
+            )
+            return
         if admission is not None:
             admission_payload = self._prefix_cache_identity_event_base(
                 event="prefix_cache_admission",
@@ -294,3 +330,48 @@ class PrefixCacheLedger:
             }
         )
         _log_frontier_vllm_v1_schedule_decision(allocation_payload)
+
+    def _check_prefix_cache_identity_events(
+        self,
+        *,
+        request: Request,
+        num_new_tokens: int,
+        allocation: KVCacheAllocationResult,
+        admission: Optional[PrefixCacheAdmission],
+    ) -> None:
+        """_emit_prefix_cache_identity_events when the log drops its events:
+        the same event sequence numbers and the same checks, in the same
+        order, raising the same errors, without building the payloads.
+
+        What it leaves out cannot raise or change state: the payloads' int,
+        str and bool conversions of ints that bindings, blocks and the
+        admission already hold as ints (KVCacheBlock.binding builds bindings
+        with int()), and the query-hash list read."""
+        int(num_new_tokens)
+        if admission is not None:
+            self._prefix_cache_identity_event_base(
+                event="prefix_cache_admission",
+                request=request,
+            )
+            if admission.raw_hit_bindings or admission.effective_hit_bindings:
+                query_hashes = request.lookup_block_hash_ids(
+                    int(self._config.block_size)
+                )
+                for bindings in (
+                    admission.raw_hit_bindings,
+                    admission.effective_hit_bindings,
+                ):
+                    if _hit_bindings_may_disagree(bindings, query_hashes):
+                        # raises the serializer's error, if any
+                        self._serialize_prefix_cache_hit_bindings(
+                            request=request, bindings=bindings
+                        )
+        self._prefix_cache_identity_event_base(
+            event="prefix_cache_allocation",
+            request=request,
+        )
+        for block in allocation.reused_blocks:
+            if block.binding is None:
+                raise ValueError(
+                    f"Reused Prefix cache block {block.block_id} has no binding identity."
+                )

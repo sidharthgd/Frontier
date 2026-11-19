@@ -263,3 +263,63 @@ def test_hit_binding_fast_check_agrees_with_the_checked_loop() -> None:
         assert _consistent_hit_bindings(hit, queries) is None
         with pytest.raises(IndexError if message is None else ValueError, match=message):
             _checked_hit_bindings(hit, queries)
+
+
+def _ledger_scheduler(manager):
+    scheduler = object.__new__(VLLMv1EngineReplicaScheduler)
+    scheduler._kv_cache_manager = manager
+    scheduler._config = SimpleNamespace(block_size=2, num_blocks=2)
+    scheduler._cluster_type = ClusterType.MONOLITHIC
+    scheduler._replica_id = 3
+    scheduler._replica_local_id = None
+    scheduler._active_schedule_iteration_id = 7
+    scheduler._current_schedule_time = 1.25
+    scheduler._prefix_cache_identity_event_seq = 0
+    scheduler._allocation_map = {}
+    scheduler._num_allocated_blocks = 0
+    return scheduler
+
+
+@pytest.mark.parametrize("logged", [False, True])
+def test_unlogged_identity_events_keep_sequence_and_checks(monkeypatch, logged) -> None:
+    import dataclasses
+
+    assert prefix_cache_module._decision_log_discards_events()
+    if logged:
+        monkeypatch.setattr(
+            prefix_cache_module, "_log_frontier_vllm_v1_schedule_decision", lambda event: None
+        )
+        assert not prefix_cache_module._decision_log_discards_events()
+    manager = _manager()
+    creator = _request(hashes=[11, 22])
+    manager.allocate_slots(creator, 4)
+    manager.free(creator)
+    consumer = _request(hashes=[11, 22])
+    scheduler = _ledger_scheduler(manager)
+    admission = scheduler._prepare_prefix_cache_admission(consumer)
+    allocation = scheduler._allocate_request(
+        consumer,
+        admission.num_new_tokens,
+        new_computed_blocks=list(admission.effective_hit_blocks),
+        prefix_cache_admission=admission,
+    )
+    assert allocation is not None
+    assert scheduler._prefix_cache_identity_event_seq == 2
+
+    # a hit binding that disagrees with its query raises the same error either way
+    bad = dataclasses.replace(
+        admission,
+        raw_hit_bindings=(dataclasses.replace(admission.raw_hit_bindings[0], block_hash=99),),
+    )
+    with pytest.raises(ValueError, match="query_index=0, query_hash=11, binding_hash=99"):
+        scheduler._emit_prefix_cache_identity_events(
+            request=consumer, num_new_tokens=2, allocation=allocation, admission=bad
+        )
+    assert scheduler._prefix_cache_identity_event_seq == 3
+    too_many = dataclasses.replace(
+        admission, effective_hit_bindings=admission.raw_hit_bindings * 2
+    )
+    with pytest.raises(ValueError, match="exceeds the ordered query hash count"):
+        scheduler._emit_prefix_cache_identity_events(
+            request=consumer, num_new_tokens=2, allocation=allocation, admission=too_many
+        )
