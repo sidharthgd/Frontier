@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 
 from frontier.entities import Batch, Request
+from frontier.rl import fast_forest
 from frontier.rl.observation import Observation, build_observation
 from frontier.rl.reward import RewardConfig, transition_components
 from frontier.simulator import Simulator
@@ -92,8 +93,40 @@ class WorkloadSpec:
     # ~3%), so that prediction memo hits across episodes; None = exact.
     # Approximate, like Vidur's 64-token KV granularity; see rl/README.
     prediction_rounding_bits: Optional[int] = None
+    # decode CUDA graphs as vLLM runs them: none | piecewise | full_decode_only
+    decode_cuda_graph_mode: str = "none"
+    # context limit (vLLM --max-model-len) and the predictor's lookup range
+    # (prediction_max_tokens_per_request None: max(max_tokens, 4096))
+    max_model_len: Optional[int] = None
+    prediction_max_tokens_per_request: Optional[int] = None
+    prediction_max_batch_size: Optional[int] = None
     # any other frontier.main flags, e.g. ["--enable_thinking_mode", ...]
     extra_args: List[str] = field(default_factory=list)
+
+
+def a100_llama31_8b(**overrides) -> "WorkloadSpec":
+    """
+    A100 80GB PCIe + Llama-3.1-8B as validated against vLLM 0.10.2
+    (data/profiling/compute/a100/llama3.1-8b/README.md): FlashInfer, 2048-token
+    steps, 256 sequences, 128k context, 453,088-token KV cache, piecewise CUDA
+    graphs, no CPU-overhead tables.
+    """
+    spec = dict(A100_LLAMA31_8B)
+    spec.update(overrides)
+    return WorkloadSpec(**spec)
+
+
+# a100_llama31_8b's settings (also a named preset for the training stack's
+# `frontier: {preset: a100_llama31_8b}`)
+A100_LLAMA31_8B = dict(
+    name="a100_llama31_8b",
+    model="llama3.1-8b", device="a100", network_device="a100_dgx",
+    max_tokens_in_batch=2048, batch_size_cap=256, num_blocks=28318,
+    decode_cuda_graph_mode="piecewise", model_cpu_overhead=False,
+    max_model_len=131072, prediction_max_tokens_per_request=131072,
+    prediction_max_batch_size=256, max_tokens=131072,
+)
+PRESETS = {"a100_llama31_8b": A100_LLAMA31_8B}
 
 
 def simulation_args(
@@ -114,13 +147,17 @@ def simulation_args(
         "--vllm_v1_scheduler_config_enable_chunked_prefill",
         "--vllm_v1_scheduler_config_max_tokens_in_batch", str(spec.max_tokens_in_batch),
         "--vllm_v1_scheduler_config_batch_size_cap", str(spec.batch_size_cap),
-        "--decode_cuda_graph_mode", "none",
+        "--decode_cuda_graph_mode", spec.decode_cuda_graph_mode,
         "--random_forrest_execution_time_predictor_config_prediction_max_prefill_chunk_size",
         str(max(spec.max_tokens_in_batch, 1024)),
         # the predictor's own request-length limit (default 4096) must cover
         # the workload's requests, e.g. 131072 for 128k-context traces
         "--random_forrest_execution_time_predictor_config_prediction_max_tokens_per_request",
-        str(max(spec.max_tokens, 4096)),
+        str(
+            spec.prediction_max_tokens_per_request
+            if spec.prediction_max_tokens_per_request is not None
+            else max(spec.max_tokens, 4096)
+        ),
         "--metrics_config_output_dir", output_dir,
         "--no-metrics_config_write_metrics",
         "--no-metrics_config_store_plots",
@@ -147,6 +184,13 @@ def simulation_args(
         ]
     if spec.enable_prefix_caching:
         args += ["--vllm_v1_scheduler_config_enable_prefix_caching"]
+    if spec.max_model_len is not None:
+        args += ["--vllm_v1_scheduler_config_max_model_len", str(spec.max_model_len)]
+    if spec.prediction_max_batch_size is not None:
+        args += [
+            "--random_forrest_execution_time_predictor_config_prediction_max_batch_size",
+            str(spec.prediction_max_batch_size),
+        ]
 
     if spec.arrivals in ("replay", "sessions"):
         if spec.arrivals == "sessions":
@@ -329,6 +373,10 @@ def _shared_predictors(key: Tuple) -> Iterator[None]:
     finally:
         ExecutionTimePredictorRegistry.get = original
 
+
+# bit-identical single-row forest predictions, ~10x faster episodes
+if os.environ.get("FRONTIER_FAST_FOREST", os.environ.get("VIDUR_FRONTIER_FAST_FOREST", "1")) != "0":
+    fast_forest.install()
 
 FRONTIER_ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

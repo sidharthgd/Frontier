@@ -27,16 +27,15 @@ priority mode it preempts the running request with the largest (priority,
 arrival), so a request's priority still matters after admission (Vidur
 preempts the most recently admitted one).
 
-Importing this module swaps sklearn's single-row forest prediction for
-frontier/rl/sched/fast_forest.py (bit-identical, ~10x faster episodes); set
-VIDUR_FRONTIER_FAST_FOREST=0 to keep sklearn's.
+Importing frontier/rl/env.py (which this module does) swaps sklearn's
+single-row forest prediction for frontier/rl/fast_forest.py (bit-identical,
+~10x faster episodes); set FRONTIER_FAST_FOREST=0 to keep sklearn's.
 """
 
 import copy
 import hashlib
 from collections import deque
 import os
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from math import ceil
@@ -45,7 +44,6 @@ from typing import Any, Dict, Iterator, List, Optional
 import numpy as np
 import pandas as pd
 
-from frontier.rl.sched import fast_forest
 from frontier.rl.sched.action import admission_action_bounds
 from frontier.rl.sched.agents import BaseAgent, OracleAgent
 from frontier.rl.sched.env import (
@@ -78,6 +76,7 @@ from frontier.rl.sched.workload import (
 from frontier.entities import Request as FrontierRequest
 from frontier.rl.env import (
     FRONTIER_ROOT,
+    PRESETS,
     WorkloadSpec,
     _engine_key,
     _RLSimulator,
@@ -86,6 +85,7 @@ from frontier.rl.env import (
 )
 from frontier.rl.env import make_simulation_config as frontier_config
 from frontier.rl.observation import prefix_cache_view
+from frontier.rl.scoring import ScoreWindow
 from frontier.rl.scheduler import (
     PriorityPolicy,
     RLVLLMv1EngineReplicaScheduler,
@@ -96,9 +96,6 @@ from frontier.scheduler.replica_scheduler.replica_scheduler_registry import (
 )
 from frontier.types import ReplicaSchedulerType
 from frontier.utils.random import set_seeds
-
-if os.environ.get("VIDUR_FRONTIER_FAST_FOREST", "1") != "0":
-    fast_forest.install()
 
 # WorkloadSpec fields (frontier/rl/env.py) a workload's `frontier` dict can set.
 # Llama-2-7B on H200 is the dense model Frontier has full profiles for (mixed
@@ -112,6 +109,25 @@ FRONTIER_DEFAULTS: Dict[str, Any] = {
     "prediction_rounding_bits": None,
     "enable_prefix_caching": False,
 }
+
+
+# what a frontier preset may not set: the workload and the scheduler sizes,
+# which come from the workload config (rollout.WorkloadConfig)
+_NOT_FROM_PRESET = ("name", "max_tokens", "max_tokens_in_batch", "batch_size_cap", "num_blocks")
+
+
+def frontier_settings(frontier: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """WorkloadSpec settings of a workload's `frontier` dict: FRONTIER_DEFAULTS,
+    then the engine settings of `preset` (frontier/rl/env.py PRESETS, the ones
+    FrontierSchedulingEnv uses), then the dict's own keys."""
+    frontier = dict(frontier or {})
+    preset = frontier.pop("preset", None)
+    settings = dict(FRONTIER_DEFAULTS)
+    if preset is not None:
+        assert preset in PRESETS, f"unknown frontier preset {preset!r} (known: {sorted(PRESETS)})"
+        settings.update({k: v for k, v in PRESETS[preset].items() if k not in _NOT_FROM_PRESET})
+    settings.update(frontier)
+    return settings
 
 
 class FrontierFeatureScheduler(RLVLLMv1EngineReplicaScheduler):
@@ -329,49 +345,14 @@ class _BridgePolicy(PriorityPolicy):
         self.token_gaps: List[float] = []
         # (end time, duration, number of requests) per batch
         self.batches: List[tuple] = []
-        # session_concurrency: score each agent's first per_agent calls
-        # arriving after warmup_s (set_score_window), stopping the simulator
-        # once they all finish; a fixed quota per agent, so a policy that
-        # starves an agent cannot shrink that agent's share of the score
-        self._score_window = None
-        self._simulator = None
-        self._arrived: Dict[int, FrontierRequest] = {}
-        self.scored_ids: Optional[set] = None
-
-    def set_score_window(
-        self, simulator, warmup_s: float, per_agent: int, num_agents: int
-    ) -> None:
-        self._simulator = simulator
-        self._score_window = (float(warmup_s), int(per_agent), int(num_agents))
-
-    @property
-    def num_scored(self) -> int:
-        return self._score_window[1] * self._score_window[2]
-
-    def score_window_ids(self) -> set:
-        """Each agent's (session_id's) first per_agent calls arriving after warmup_s."""
-        warmup_s, per_agent, _ = self._score_window
-        late = [r for r in self._arrived.values() if float(r.arrived_at) >= warmup_s]
-        late.sort(key=lambda r: (float(r.arrived_at), r.id))
-        taken: Dict[Any, int] = {}
-        ids = set()
-        for r in late:
-            if taken.get(r.session_id, 0) < per_agent:
-                taken[r.session_id] = taken.get(r.session_id, 0) + 1
-                ids.add(r.id)
-        return ids
-
-    def _maybe_stop(self) -> None:
-        ids = self.score_window_ids()
-        if len(ids) == self.num_scored and all(i in self.completed_at for i in ids):
-            self.scored_ids = ids
-            self._simulator._terminate = True
+        # session_concurrency: the calls the episode scores (frontier/rl/scoring.py)
+        self.score_window: Optional[ScoreWindow] = None
 
     def get_priorities(self, waiting, scheduler):
         self._pending = None
-        if self._score_window is not None:
+        if self.score_window is not None:
             for r in waiting:
-                self._arrived.setdefault(r.id, r)
+                self.score_window.saw(r)
         # Vidur ranks only when there is something to reorder
         if len(waiting) < 2:
             return None
@@ -477,8 +458,8 @@ class _BridgePolicy(PriorityPolicy):
         finished = False
         for request in batch.requests:
             self.requests.setdefault(request.id, request)
-            if self._score_window is not None:
-                self._arrived.setdefault(request.id, request)
+            if self.score_window is not None:
+                self.score_window.saw(request)
                 finished = finished or (request.completed and request.id not in self.completed_at)
             emitted = request.num_emitted_decode_tokens
             if request.id not in self.first_token_at:
@@ -491,7 +472,7 @@ class _BridgePolicy(PriorityPolicy):
             if request.completed and request.id not in self.completed_at:
                 self.completed_at[request.id] = float(request.completed_at)
         if finished:
-            self._maybe_stop()
+            self.score_window.maybe_stop(self.completed_at)
 
     def _token(self, request_id: int, time: float, gap: float) -> None:
         self._last_token_at[request_id] = time
@@ -592,7 +573,7 @@ class FrontierEnv(SchedulingEnv):
         self._execution_time_predictor = None
         self._reference_episodes = {}
 
-        settings = dict(FRONTIER_DEFAULTS, **(frontier or {}))
+        settings = frontier_settings(frontier)
         self._spec_kwargs = dict(
             settings,
             max_tokens_in_batch=scheduler_config.max_num_batched_tokens,
@@ -699,23 +680,17 @@ class FrontierEnv(SchedulingEnv):
             if getattr(generator_config, "session_concurrency", 0):
                 # agents = slots actually sampled (synthetic scales the count)
                 num_agents = int(frame["session_id"].nunique())
-                policy.set_score_window(
+                policy.score_window = ScoreWindow.for_workload(
                     simulator,
                     generator_config.session_warmup,
-                    -(-generator_config.num_requests // num_agents),
+                    generator_config.num_requests,
                     num_agents,
                 )
             simulator.run()
         end_time = float(simulator._time)
-        if policy._score_window is not None:
+        if policy.score_window is not None:
             # everything outside the scored window is warm-up or spill-over
-            scored = policy.scored_ids or policy.score_window_ids()
-            if len(scored) < policy.num_scored:
-                warnings.warn(
-                    f"session_concurrency: only {len(scored)} of {policy.num_scored} "
-                    f"calls arrived after the warm-up; raise CONCURRENT_OVERPROVISION"
-                )
-            warmup_ids = set(policy.requests) - scored
+            warmup_ids = set(policy.requests) - policy.score_window.final_ids()
         return self._episode(policy, end_time, reward_config, context, warmup_ids)
 
     def _episode(

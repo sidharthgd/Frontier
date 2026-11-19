@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from frontier.rl.env import FRONTIER_ROOT
+from frontier.rl.scoring import CONCURRENT_OVERPROVISION
 from frontier.utils.random import set_seeds
 
 # --- configs -------------------------------------------------------------------
@@ -398,9 +399,6 @@ def _trace_window_requests(config: TraceWindowRequestGeneratorConfig) -> List[Wo
     ]
 
 
-# session_concurrency: calls generated per scored call (warm-up included);
-# the simulation stops once the scored ones finish, so extras are cheap
-CONCURRENT_OVERPROVISION = 4
 
 
 def _session_requests(config: SessionTraceRequestGeneratorConfig) -> List[WorkloadRequest]:

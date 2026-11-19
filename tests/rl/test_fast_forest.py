@@ -1,8 +1,8 @@
 """
-frontier/rl/sched/fast_forest.py must match sklearn's ForestRegressor.predict bit for
+frontier/rl/fast_forest.py must match sklearn's ForestRegressor.predict bit for
 bit, or hand the call to sklearn (same result or same exception).
 
-    python -m pytest tests/rl/sched/test_fast_forest.py -v
+    python -m pytest tests/rl/test_fast_forest.py -v
 """
 
 import numpy as np
@@ -11,7 +11,7 @@ import pytest
 import scipy.sparse as sp
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 
-from frontier.rl.sched import fast_forest
+from frontier.rl import fast_forest
 
 rng = np.random.default_rng(0)
 X = np.vstack([rng.lognormal(3, 2, size=(1500, 6)), rng.integers(0, 50, size=(300, 6))]).astype(float)
