@@ -433,6 +433,9 @@ class AgentPriorityPolicy(PriorityPolicy):
         self.transitions: List[Transition] = []
         self.num_dropped = 0
         self.records: Dict[int, RequestRecord] = {}
+        # TTFT deadline (s): a call that has waited longer for its first token
+        # goes ahead of every other, oldest first, whatever the agent chose
+        self.deadline_s: Optional[float] = None
 
     def _record(self, request: Request) -> RequestRecord:
         record = self.records.get(request.id)
@@ -454,7 +457,7 @@ class AgentPriorityPolicy(PriorityPolicy):
         if not waiting:
             return None
         time = float(self._clock())
-        obs = build_observation(time, waiting, scheduler, self._num_levels)
+        obs = build_observation(time, waiting, scheduler, self._num_levels, self.deadline_s)
         if isinstance(self._agent, OracleAgent):
             priorities, info = self._agent.act_oracle(obs, waiting, scheduler)
         else:
@@ -469,6 +472,18 @@ class AgentPriorityPolicy(PriorityPolicy):
         transition = Transition(time, obs, priorities, info, [], None)
         self._pending = (transition, list(waiting), previous)
         return priorities
+
+    def apply_deadline(self, waiting) -> None:
+        """Put calls past the deadline first (priority -1, so oldest first)."""
+        if self.deadline_s is None:
+            return
+        now = float(self._clock())
+        for request in waiting:
+            if (
+                self._record(request).first_token_at is None
+                and now - request.arrived_at >= self.deadline_s
+            ):
+                request.set_priority(-1)
 
     def on_admission(self, admitted, boundary):
         if self._pending is None:
@@ -551,12 +566,15 @@ class FrontierSchedulingEnv:
                 simulator = _RLSimulator(config, self._sessions(seed))
         return simulator
 
-    def run_episode(self, agent: BaseAgent, seed: int = 0) -> Episode:
+    def run_episode(
+        self, agent: BaseAgent, seed: int = 0, deadline_s: Optional[float] = None
+    ) -> Episode:
         with _working_dir(FRONTIER_ROOT):
             simulator = self.make_simulator(seed)
             policy = AgentPriorityPolicy(
                 agent, self.num_priority_levels, clock=lambda: simulator._time
             )
+            policy.deadline_s = deadline_s
             schedulers = replica_schedulers(simulator)
             assert len(schedulers) == 1, "the env drives a single replica"
             schedulers[0].set_priority_policy(policy)

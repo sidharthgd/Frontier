@@ -80,6 +80,21 @@ class TrainConfig:
     ttft_ref_weight: float = 0.0
     ttft_ref_k: float = 2.0
     ttft_ref_floor: float = 5.0
+    # per-episode TTFT deadline D = deadline_c x the p99 TTFT FCFS gets on the same
+    # (load, seed): the scheduler puts a call past D first, whatever the policy
+    # chose. None = no deadline. The TTFT reward threshold becomes
+    # deadline_penalty_frac x D, so waiting is charged before the scheduler steps in
+    deadline_c: Optional[float] = None
+    deadline_penalty_frac: float = 0.75
+    # > 0: training seeds cycle through this many fixed seeds, so each FCFS
+    # reference (and deadline) is simulated once for the whole run
+    seed_pool: int = 0
+    # checkpoint choice: mean session serving change plus score_tail_weight x the
+    # average excess of per-load p99 TTFT and p99 e2e over FCFS beyond score_tail_margin (%)
+    score_tail_margin: float = 10.0
+    score_tail_weight: float = 0.5
+    # continue from <output_dir>/state.pt (written every PPO iteration)
+    resume: bool = False
     tau_s: float = 120.0
     # model
     num_priority_levels: int = 16
@@ -221,6 +236,8 @@ class Task:
     # FCFS TTFT of every call of this (load, seed), keyed (session, call index);
     # computed once per iteration and shared, see Trainer.attach_references
     ttft_reference: Optional[Dict[tuple, float]] = None
+    # TTFT deadline of this episode (policy tasks only), see TrainConfig.deadline_c
+    deadline_s: Optional[float] = None
 
 
 @dataclass
@@ -305,7 +322,10 @@ def run_task(payload) -> Trajectory:
     else:
         agent = baseline_agent(task.kind, task.agent_seed)
     env.reward_config.ttft_reference = task.ttft_reference
-    episode = env.run_episode(agent, task.workload_seed)
+    env.reward_config.ttft_threshold = (
+        config.deadline_penalty_frac * task.deadline_s if task.deadline_s else config.ttft_threshold
+    )
+    episode = env.run_episode(agent, task.workload_seed, deadline_s=task.deadline_s)
     steps = []
     if task.kind == "policy":
         for t in episode.transitions:
@@ -646,7 +666,8 @@ def ppo_update_pl(model, optimizer, trajectories, config: TrainConfig, rng) -> D
 
 # --- evaluation ----------------------------------------------------------------
 
-EVAL_METRICS = ("mean_session_serving", "p99_session_serving", "mean_ttft", "p99_ttft", "cached_prefill_fraction")
+EVAL_METRICS = ("mean_session_serving", "p99_session_serving", "mean_ttft", "p99_ttft", "p99_e2e",
+                "cached_prefill_fraction")
 
 
 def _vs_fcfs(results: Dict[Tuple[str, int, int], Dict[str, float]], kind: str, loads, seeds) -> Dict[str, float]:
@@ -663,8 +684,10 @@ def _vs_fcfs(results: Dict[Tuple[str, int, int], Dict[str, float]], kind: str, l
     return out
 
 
-def evaluate(pool, model, config: TrainConfig, baselines) -> Dict[str, float]:
+def evaluate(pool, model, config: TrainConfig, baselines, attach=None) -> Dict[str, float]:
     tasks = [Task(l, s, "policy", decoding="rank") for l in config.loads for s in config.eval_seeds]
+    if attach is not None:
+        tasks = attach(tasks)
     results = dict(baselines)
     for t in pool.run(model.state_dict(), tasks):
         results[("policy", t.task.load, t.task.workload_seed)] = t.summary
@@ -672,8 +695,16 @@ def evaluate(pool, model, config: TrainConfig, baselines) -> Dict[str, float]:
 
 
 def score(metrics: Dict[str, float], config: TrainConfig) -> float:
-    """Lower is better: % session serving change plus a share of the TTFT tail's."""
-    return metrics["mean_session_serving"] + 0.1 * metrics["p99_ttft"]
+    """
+    Lower is better: the % change in mean session serving plus a penalty for tails
+    worse than FCFS. The penalty is score_tail_weight x the average, over loads and
+    over p99 TTFT and p99 e2e, of how far each exceeds FCFS beyond score_tail_margin %
+    (so a policy that matches FCFS's tails is judged on its mean alone).
+    """
+    excess = [max(0.0, v - config.score_tail_margin) for k, v in metrics.items()
+              if k.endswith(("/p99_ttft", "/p99_e2e"))]
+    tail = float(np.mean(excess)) if excess else 0.0
+    return metrics["mean_session_serving"] + config.score_tail_weight * tail
 
 
 # --- main ----------------------------------------------------------------------
@@ -692,6 +723,7 @@ class Trainer:
             self.model.load_state_dict(torch.load(config.init_checkpoint)["model"])
         self.pool = Pool(config)
         self.next_seed = TRAIN_SEED_BASE
+        self._draws = 0
         self.best = float("inf")
         self.metrics_file = open(os.path.join(config.output_dir, "metrics.jsonl"), "a")
         self.start = time.time()
@@ -703,9 +735,33 @@ class Trainer:
         print(json.dumps(record), flush=True)
 
     def seeds(self, n: int) -> List[int]:
+        if self.config.seed_pool > 0:
+            seeds = [TRAIN_SEED_BASE + (self._draws + i) % self.config.seed_pool for i in range(n)]
+            self._draws += n
+            return seeds
         seeds = list(range(self.next_seed, self.next_seed + n))
         self.next_seed += n
         return seeds
+
+    def load_state(self) -> Optional[Dict]:
+        """Restore what save_state wrote (model, best, seed counters, rng); None if absent."""
+        path = os.path.join(self.config.output_dir, "state.pt")
+        if not os.path.exists(path):
+            return None
+        state = torch.load(path, weights_only=False)
+        self.model.load_state_dict(state["model"])
+        self.best, self.next_seed, self._draws = state["best"], state["next_seed"], state["draws"]
+        self.rng.bit_generator.state = state["rng"]
+        return state
+
+    def save_state(self, iteration: int, optimizer) -> None:
+        """Everything run() needs to continue from this iteration (config.resume)."""
+        torch.save(
+            {"model": self.model.state_dict(), "optimizer": optimizer.state_dict(),
+             "iteration": iteration, "best": self.best, "next_seed": self.next_seed,
+             "draws": self._draws, "rng": self.rng.bit_generator.state},
+            os.path.join(self.config.output_dir, "state.pt"),
+        )
 
     def save(self, name: str) -> None:
         torch.save(
@@ -715,7 +771,7 @@ class Trainer:
         )
 
     def eval_and_save(self, phase: str, iteration: int) -> None:
-        metrics = evaluate(self.pool, self.model, self.config, self.baselines)
+        metrics = evaluate(self.pool, self.model, self.config, self.baselines, self.attach_references)
         self.save("latest.pt")
         s = score(metrics, self.config)
         if s < self.best:
@@ -724,16 +780,26 @@ class Trainer:
         self.log({"phase": phase, "iteration": iteration, "eval": metrics, "score": s, "best": self.best})
 
     def attach_references(self, tasks: List[Task]) -> List[Task]:
-        """Give each task the FCFS per-call TTFT of its (load, seed) for the
-        FCFS-relative reward, simulating each FCFS episode once, not per task."""
-        if self.config.ttft_ref_weight <= 0:
+        """
+        Give each task what depends on FCFS at its (load, seed): the per-call TTFTs
+        for the FCFS-relative reward and, for policy tasks, the episode's deadline
+        (deadline_c x FCFS's p99 TTFT). Each FCFS episode is simulated once, here,
+        not per task.
+        """
+        c = self.config
+        if c.ttft_ref_weight <= 0 and c.deadline_c is None:
             return tasks
+        from frontier.rl.env import _quantile
+
         refs = self.__dict__.setdefault("_references", {})
         missing = sorted({(t.load, t.workload_seed) for t in tasks} - set(refs))
         for t in self.pool.run(None, [Task(l, s, "fcfs") for l, s in missing]):
             refs[(t.task.load, t.task.workload_seed)] = t.call_ttft
         for t in tasks:
-            t.ttft_reference = refs[(t.load, t.workload_seed)]
+            reference = refs[(t.load, t.workload_seed)]
+            t.ttft_reference = reference
+            if c.deadline_c is not None and t.kind == "policy":
+                t.deadline_s = c.deadline_c * _quantile(np.array(list(reference.values())), 0.99)
         return tasks
 
     def run(self) -> None:
@@ -751,7 +817,11 @@ class Trainer:
                 json.dump({json.dumps(list(k)): v for k, v in self.baselines.items()}, f)
         self.log({"phase": "baselines", "teacher": _vs_fcfs(self.baselines, c.teacher, c.loads, c.eval_seeds)})
 
-        if c.imitation_iterations > 0 and not c.init_checkpoint:
+        state = self.load_state() if c.resume else None
+        resumed = state is not None
+        if resumed:
+            self.log({"phase": "resume", "iteration": state["iteration"]})
+        elif c.imitation_iterations > 0 and not c.init_checkpoint:
             optimizer = torch.optim.Adam(self.model.policy_parameters(), lr=c.imitation_lr)
             dataset: List[Step] = []
             beta = 1.0
@@ -770,7 +840,11 @@ class Trainer:
             self.eval_and_save("init", 0)
 
         optimizer = torch.optim.Adam(self.model.policy_parameters(), lr=c.learning_rate)
-        for it in range(1, c.ppo_iterations + 1):
+        first = 1
+        if resumed:
+            optimizer.load_state_dict(state["optimizer"])
+            first = state["iteration"] + 1
+        for it in range(first, c.ppo_iterations + 1):
             tasks = [Task(l, s, "policy", agent_seed=1_000_000 * g + s, teacher=c.imitation_coef > 0,
                           decoding="pl" if c.method == "pl" else "sample")
                      for l in c.loads for s in self.seeds(c.seeds_per_iteration)
@@ -785,6 +859,7 @@ class Trainer:
                       "train_mean_session_serving": {l: float(np.mean(v)) for l, v in serving.items()}})
             if it % c.eval_every == 0 or it == c.ppo_iterations:
                 self.eval_and_save("ppo", it)
+            self.save_state(it, optimizer)
         self.pool.close()
 
 

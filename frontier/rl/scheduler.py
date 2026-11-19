@@ -217,6 +217,7 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
                 assert len(priorities) == len(waiting)
                 for request, priority in zip(waiting, priorities):
                     request.set_priority(int(priority))
+                self._priority_policy.apply_deadline(waiting)
         ranked = super()._get_sorted_waiting_queue()
         self._ranked_waiting = list(ranked)
         return ranked

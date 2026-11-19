@@ -7,7 +7,7 @@ it. Oracle baselines get the Request objects separately (env.OracleAgent).
 
 from dataclasses import dataclass
 from math import ceil
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -45,6 +45,7 @@ GLOBAL_FEATURES: Tuple[str, ...] = (
     "num_running",
     "max_tokens_in_batch",
     "batch_size_cap",
+    "deadline_s",             # TTFT deadline of this episode (calls past it go first); -1 none
 )
 
 
@@ -87,6 +88,7 @@ def build_observation(
     waiting: List[Request],
     scheduler: "RLVLLMv1EngineReplicaScheduler",
     num_priority_levels: int,
+    deadline_s: Optional[float] = None,
 ) -> Observation:
     block_size = scheduler.block_size
     free = max(1, scheduler.num_free_blocks)
@@ -129,6 +131,7 @@ def build_observation(
         len(running_rows),
         scheduler.max_tokens_in_batch,
         scheduler.batch_size_cap,
+        -1.0 if deadline_s is None else float(deadline_s),
     )
     return Observation(
         time=time,
