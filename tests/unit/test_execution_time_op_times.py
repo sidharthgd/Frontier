@@ -1160,3 +1160,33 @@ def test_forward_launch_stall_time_ends_the_forward_no_earlier_than_launch_plus_
         **_base_execution_kwargs(forward_launch_time=launch_ms, forward_drain_time=drain_ms)
     )
     assert execution_time.forward_launch_stall_time(device_span) == pytest.approx(expected)
+
+
+def test_operator_times_fast_deepcopy_matches_deepcopy() -> None:
+    import copy
+
+    from frontier.entities.execution_time import (
+        _OPERATOR_TIMES_TYPES,
+        _deepcopy_operator_times,
+    )
+
+    for cls in _OPERATOR_TIMES_TYPES:
+        # the fast path relies on plain dataclass copy semantics
+        assert cls.__new__ is object.__new__
+        assert cls.__reduce_ex__ is object.__reduce_ex__
+        assert cls.__getstate__ is object.__getstate__
+        assert not hasattr(cls, "__deepcopy__") and not hasattr(cls, "__setstate__")
+        assert set(vars(cls())) == {"op_times"}
+    from frontier.entities.time_components import AttentionOperatorTimes
+
+    source = AttentionOperatorTimes({"attn_prefill": 4.0, "attn_rope": 1.5})
+    fast, slow = _deepcopy_operator_times(source), copy.deepcopy(source)
+    assert type(fast) is type(slow) and fast == slow
+    assert list(fast.op_times.items()) == list(slow.op_times.items())
+    assert fast.op_times is not source.op_times
+    assert _deepcopy_operator_times(None) is None
+    odd = AttentionOperatorTimes({"attn_prefill": 4.0})
+    odd.op_times["attn_prefill"] = [4.0]  # not a float: deepcopied
+    copied = _deepcopy_operator_times(odd)
+    assert copied.op_times["attn_prefill"] == [4.0]
+    assert copied.op_times["attn_prefill"] is not odd.op_times["attn_prefill"]

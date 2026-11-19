@@ -26,6 +26,38 @@ from frontier.entities.time_components import (
 from frontier.operators.families import get_comm_operator
 
 
+_OPERATOR_TIMES_TYPES = frozenset(
+    (
+        AttentionOperatorTimes,
+        CommunicationOperatorTimes,
+        MLPOperatorTimes,
+        MoEOperatorTimes,
+    )
+)
+
+
+def _deepcopy_operator_times(value):
+    """deepcopy(value), cheaply for the usual operator-times record.
+
+    An instance of one of these plain dataclasses (no copy or pickle hooks)
+    whose whole state is op_times, a dict of str -> float, deep-copies to a
+    new instance holding a new dict of the same (atomic) keys and values in
+    the same order, which is what this builds. Anything else is deepcopied.
+    """
+    if type(value) in _OPERATOR_TIMES_TYPES:
+        state = value.__dict__
+        op_times = state.get("op_times")
+        if (
+            len(state) == 1
+            and type(op_times) is dict
+            and all(type(k) is str and type(v) is float for k, v in op_times.items())
+        ):
+            result = object.__new__(type(value))
+            result.__dict__["op_times"] = dict(op_times)
+            return result
+    return deepcopy(value)
+
+
 # Each operator has one physical EP phase and one existing public scalar source.
 _MOE_PHASE_COMPONENTS = {
     "pre_dispatch": (
@@ -193,10 +225,10 @@ class ExecutionTime(BaseEntity):
             communication_operator_times = (
                 build_communication_operator_times_from_op_times(merged_op_times)
             )
-        attention_operator_times = deepcopy(attention_operator_times)
-        mlp_operator_times = deepcopy(mlp_operator_times)
-        moe_operator_times = deepcopy(moe_operator_times)
-        communication_operator_times = deepcopy(communication_operator_times)
+        attention_operator_times = _deepcopy_operator_times(attention_operator_times)
+        mlp_operator_times = _deepcopy_operator_times(mlp_operator_times)
+        moe_operator_times = _deepcopy_operator_times(moe_operator_times)
+        communication_operator_times = _deepcopy_operator_times(communication_operator_times)
 
         op_time_attr_values = execution_op_time_values_by_attr(merged_op_times)
 
