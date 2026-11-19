@@ -106,6 +106,8 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
         super().__init__(*args, **kwargs)
         self._priority_policy: Optional[PriorityPolicy] = None
         self._ranked_waiting: List[Request] = []
+        # called with each request that finishes, after the batch ends
+        self.completion_listeners: List[Callable[[Request], None]] = []
 
     def set_priority_policy(self, policy: Optional[PriorityPolicy]) -> None:
         if policy is not None:
@@ -255,6 +257,11 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
         super().on_batch_end(batch)
         if self._priority_policy is not None:
             self._priority_policy.on_batch_end(batch)
+        if self.completion_listeners:
+            for request in batch.requests:
+                if request.completed:
+                    for listener in self.completion_listeners:
+                        listener(request)
 
 
 @contextmanager
