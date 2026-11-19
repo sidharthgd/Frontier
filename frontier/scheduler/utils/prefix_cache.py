@@ -60,6 +60,8 @@ def validate_prefix_cache_config(
             "Prefix caching trace request source requires an existing trace file "
             f"with session_id and block_hash_ids columns. Got {trace_file}."
         )
+    # an agentic prompt's block_hash_ids can pass csv's 128 KiB field limit
+    csv.field_size_limit(max(csv.field_size_limit(), 1 << 30))
     with trace_file.open("r", encoding="utf-8", newline="") as file:
         reader = csv.DictReader(file)
         required_columns = {"session_id", "block_hash_ids"}

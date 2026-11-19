@@ -30,6 +30,53 @@ from frontier.scheduler.replica_scheduler.vllm_v1_engine_replica_scheduler impor
 from frontier.types import ReplicaSchedulerType
 
 
+class _FreeOrder:
+    """Sequence numbers of the blocks in the free queue, with a Fenwick tree
+    of which are still queued (from agent-sessions-local)."""
+
+    def __init__(self) -> None:
+        self._size = 1 << 16
+        self._tree = [0] * (self._size + 1)
+        self._queued = bytearray(self._size)
+        self._next = 0
+
+    def _grow(self) -> None:
+        self._size *= 2
+        self._queued.extend(bytearray(self._size - len(self._queued)))
+        self._tree = [0] * (self._size + 1)
+        for i in range(self._size):
+            if self._queued[i]:
+                self._update(i, 1)
+
+    def _update(self, seq: int, delta: int) -> None:
+        i = seq + 1
+        while i <= self._size:
+            self._tree[i] += delta
+            i += i & -i
+
+    def add(self, block) -> None:
+        if self._next >= self._size:
+            self._grow()
+        block._free_seq = self._next
+        self._queued[self._next] = 1
+        self._update(self._next, 1)
+        self._next += 1
+
+    def discard(self, block) -> None:
+        seq = getattr(block, "_free_seq", None)
+        if seq is not None and self._queued[seq]:
+            self._queued[seq] = 0
+            self._update(seq, -1)
+
+    def ahead(self, seq: int) -> int:
+        """Blocks queued with a smaller sequence number: those evicted before this one."""
+        total, i = 0, seq
+        while i > 0:
+            total += self._tree[i]
+            i -= i & -i
+        return total
+
+
 class PriorityPolicy:
     """
     What the scheduler calls. get_priorities returns one priority per request
@@ -97,6 +144,83 @@ class RLVLLMv1EngineReplicaScheduler(VLLMv1EngineReplicaScheduler):
     @property
     def prefix_caching_enabled(self) -> bool:
         return bool(self._is_prefix_caching_enabled())
+
+    # Whether the workload's block ids are chained (frontier/trace_prep's
+    # are): cache lookups for the policy can then binary search
+    # (KVCacheManager.peek_prefix_cache).
+    chained_block_hashes = False
+
+    def _install_free_order(self) -> _FreeOrder:
+        """
+        Track the free queue's order exactly. Each block gets a sequence number
+        when it enters the queue (the queue is FIFO, so the order is the
+        sequence), and a Fenwick tree counts the sequence numbers still queued.
+        The number of blocks ahead of a block, i.e. how many allocations until
+        it is evicted, is then one prefix sum: O(log blocks) per queue
+        operation and per query.
+        """
+        queue = self._kv_cache_manager.block_pool.free_block_queue
+        order = getattr(queue, "_rl_order", None)
+        if order is not None:
+            return order
+        order = _FreeOrder()
+        block = queue.free_list_head
+        while block is not None:
+            order.add(block)
+            block = block.next_free_block
+        append, remove = queue.append, queue.remove
+
+        def tracked_append(block):
+            append(block)
+            order.add(block)
+
+        def tracked_remove(block):
+            order.discard(block)
+            remove(block)
+
+        # popleft goes through remove
+        queue.append, queue.remove = tracked_append, tracked_remove
+        queue._rl_order = order
+        return order
+
+    def cache_state(self, request: Request) -> Tuple[int, int, int]:
+        """
+        (cached prompt tokens, idle cached blocks, eviction distance) of a
+        waiting request, read without touching hit statistics or eviction
+        order (KVCacheManager.peek_prefix_cache for the first two). The
+        eviction distance is how many blocks will be allocated before its hit
+        loses a block: the queue position of its idle hit block that is
+        evicted first (-1: no idle hit blocks, or no prefix caching).
+
+        With chained ids that block is the hit's last: requests hold their
+        blocks from block 0 and free them tail first, so a later block of a
+        chain is never queued after an earlier one. Otherwise every idle hit
+        block is checked.
+        """
+        manager = getattr(self, "_kv_cache_manager", None)
+        if manager is None or not self.prefix_caching_enabled:
+            return 0, 0, -1
+        tokens, idle = manager.peek_prefix_cache(request, chained=self.chained_block_hashes)
+        if not idle:
+            return tokens, 0, -1
+        order = self._install_free_order()
+        pool = manager.block_pool
+        hashes = request.lookup_block_hash_array(self.block_size)[: tokens // self.block_size]
+        if self.chained_block_hashes:
+            first_out = pool.get_cached_block(int(hashes[-1]))._free_seq
+        else:
+            first_out = self._first_evicted_scan(hashes)
+        return tokens, idle, order.ahead(first_out)
+
+    def _first_evicted_scan(self, hashes) -> int:
+        """Smallest free-queue sequence number among the idle blocks."""
+        pool = self._kv_cache_manager.block_pool
+        seqs = [
+            block._free_seq
+            for block in (pool.get_cached_block(int(h)) for h in hashes)
+            if block.ref_cnt == 0
+        ]
+        return min(seqs)
 
     # -- the hook -----------------------------------------------------------
 

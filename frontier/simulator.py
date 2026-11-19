@@ -1330,7 +1330,10 @@ class Simulator:
             # Kick off the scheduling process.
             self._add_event(GlobalScheduleEvent(0))
         else:
+            held = self._hold_closed_loop_session_calls(requests)
             for request in requests:
+                if request.id in held:
+                    continue
                 # In disaggregated mode, a request first arrives at the prefill cluster
                 # In monolithic mode, it arrives at the monolithic cluster
                 cluster_type = (
@@ -1341,6 +1344,50 @@ class Simulator:
                 self._add_event(
                     RequestArrivalEvent(request.arrived_at, request, cluster_type)
                 )
+
+    def _hold_closed_loop_session_calls(self, requests) -> set:
+        """Closed-loop sessions: a call with think_time arrives think_time
+        seconds after the previous call of its session (in arrival order)
+        completes, not at its trace time, so a session never has two calls in
+        flight. Sessions stay open loop with respect to each other. Returns
+        the ids of the held calls."""
+        by_session = {}
+        for request in requests:
+            if request.session_id is not None:
+                by_session.setdefault(int(request.session_id), []).append(request)
+        successor = {}
+        for calls in by_session.values():
+            calls.sort(key=lambda r: (r.arrived_at, r.id))
+            for previous, call in zip(calls, calls[1:]):
+                if call.think_time is not None:
+                    successor[previous.id] = call
+        if not successor:
+            return set()
+        if (
+            self._config.enable_parallel_clusters
+            and self._config.is_disaggregated_mode()
+            and len(self._clusters) > 1
+        ):
+            raise ValueError(
+                "Closed-loop sessions (trace think_time) need --no-enable_parallel_clusters."
+            )
+        cluster_type = (
+            ClusterType.PREFILL
+            if self._config.is_disaggregated_mode()
+            else ClusterType.MONOLITHIC
+        )
+
+        def release(time: float, request) -> None:
+            call = successor.pop(request.id, None)
+            if call is None:
+                return
+            arrived_at = float(time) + max(float(call.think_time), 0.0)
+            call.set_arrived_at(arrived_at)
+            self._add_event(RequestArrivalEvent(arrived_at, call, cluster_type))
+
+        self._metric_store.request_end_listeners.append(release)
+        logger.info(f"Closed-loop sessions: {len(successor)} calls wait for their session's previous call")
+        return {call.id for call in successor.values()}
 
     def _set_time(self, time: float) -> None:
         self._time = time

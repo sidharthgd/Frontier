@@ -6,6 +6,10 @@ Baseline agents, by name (as in vidur/rl/agents.py):
     sjf_prefill[_age<r>]        shortest prompt first; aging subtracts r tokens per
                                 second waited. Needs no oracle.
     sjf_total[_age<r>]          oracle: prompt + true output length
+
+With prefix caching, both count only the prompt tokens the cache does not
+hold at ranking time (the prompt work admission would actually do): a 120k
+call whose first 119k tokens are cached is a 1k-token job.
 """
 
 import re
@@ -14,7 +18,7 @@ from typing import Optional
 import numpy as np
 
 from frontier.rl.env import BaseAgent, OracleAgent
-from frontier.rl.observation import Observation
+from frontier.rl.observation import Observation, cached_prefix_tokens
 
 
 class FCFSAgent(BaseAgent):
@@ -45,8 +49,9 @@ class PromptSJFAgent(BaseAgent):
         self._aging = aging
 
     def act(self, obs: Observation):
-        sizes = obs.waiting_feature("prompt_tokens") - obs.waiting_feature(
-            "processed_tokens"
+        sizes = obs.waiting_feature("prompt_tokens") - np.maximum(
+            obs.waiting_feature("processed_tokens"),
+            obs.waiting_feature("cached_prompt_tokens"),
         )
         sizes = sizes - self._aging * obs.waiting_feature("wait_time")
         return _ranks(sizes, obs), {}
@@ -60,7 +65,11 @@ class OracleSJFAgent(OracleAgent):
 
     def act_oracle(self, obs, waiting, scheduler):
         sizes = np.array(
-            [r.num_prefill_tokens + r.num_decode_tokens for r in waiting], dtype=float
+            [
+                r.num_prefill_tokens - cached_prefix_tokens(scheduler, r) + r.num_decode_tokens
+                for r in waiting
+            ],
+            dtype=float,
         )
         sizes -= self._aging * (obs.time - obs.arrival_times)
         return _ranks(sizes, obs), {}

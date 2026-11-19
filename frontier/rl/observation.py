@@ -19,7 +19,8 @@ if TYPE_CHECKING:
 WAITING_FEATURES: Tuple[str, ...] = (
     "prompt_tokens",          # prompt of the current round (grows after a restart)
     "processed_tokens",       # already computed (chunked prefill progress)
-    "cached_prompt_tokens",   # prefix-cache hit counted so far
+    "cached_prompt_tokens",   # prefix-cache hit: counted so far, or for a waiting
+                              # request the hit it would get if admitted now
     "wait_time",              # seconds since arrival
     "num_preemptions",        # times evicted so far
     "blocks_needed",          # KV blocks for the whole prompt
@@ -74,6 +75,30 @@ def _round(request: Request) -> Tuple[int, int]:
     return 0, 1
 
 
+def cached_prefix_tokens(scheduler, request: Request) -> int:
+    """Prompt tokens the scheduler's prefix cache holds for a waiting request
+    (0 without prefix caching)."""
+    return prefix_cache_state(scheduler, request)[0]
+
+
+def prefix_cache_state(scheduler, request: Request) -> Tuple[int, int]:
+    """(cached prompt tokens, idle cached blocks) of a waiting request
+    (KVCacheManager.peek_prefix_cache; (0, 0) without prefix caching)."""
+    return tuple(prefix_cache_view(scheduler, request)[:2])
+
+
+def prefix_cache_view(scheduler, request: Request) -> Tuple[int, int, int]:
+    """(cached prompt tokens, idle cached blocks, eviction distance in
+    blocks, -1 for none) of a waiting request: the RL scheduler's
+    cache_state, or the KV manager's peek for other schedulers."""
+    if hasattr(scheduler, "cache_state"):
+        return scheduler.cache_state(request)
+    manager = getattr(scheduler, "_kv_cache_manager", None)
+    if manager is None:
+        return (0, 0, -1)
+    return (*manager.peek_prefix_cache(request), -1)
+
+
 def build_observation(
     time: float,
     waiting: List[Request],
@@ -90,7 +115,7 @@ def build_observation(
             (
                 r.num_prefill_tokens,
                 r.num_processed_tokens,
-                r.num_prefill_tokens_cached,
+                max(r.num_prefill_tokens_cached, cached_prefix_tokens(scheduler, r)),
                 time - r.arrived_at,
                 r.get_total_preemption_count(),
                 blocks,

@@ -38,8 +38,10 @@ class BlockPool:
         cached = self.cached_block_hash_to_block.get(block_hash)
         if not cached:
             return None
-        first_block_id = sorted(cached.keys())[0]
-        return cached[first_block_id]
+        if len(cached) == 1:
+            for block in cached.values():
+                return block
+        return cached[min(cached)]
 
     def get_num_free_blocks(self) -> int:
         return int(self.free_block_queue.num_free_blocks)

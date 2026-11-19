@@ -115,3 +115,127 @@ def test_learned_agents_are_held_to_the_priority_levels(env):
 
     with pytest.raises(AssertionError):
         env.run_episode(TooHigh(), 0)
+
+
+def _session_replay(tmp_path, think_time):
+    """6 sessions of 4 calls, all stamped at t=0 (open loop: a pile-up)."""
+    import pandas as pd
+
+    rows = []
+    for session in range(6):
+        for step in range(4):
+            rows.append({
+                "arrived_at": 0.0, "session_id": session, "step": step,
+                "num_prefill_tokens": 400, "num_decode_tokens": 50,
+                "block_hash_ids": f"{session * 100}-{session * 100 + 24}",
+                "think_time": think_time if step else None,
+            })
+    path = tmp_path / "sessions.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return str(path)
+
+
+def _session_records(env):
+    episode = env.run_episode(baseline_agent("fcfs"), seed=0)
+    by_session = {}
+    for record in episode.requests:
+        by_session.setdefault(record.session_id, []).append(record)
+    return episode, [sorted(calls, key=lambda r: r.arrived_at) for calls in by_session.values()]
+
+
+def test_closed_loop_sessions_wait_for_their_previous_call(tmp_path):
+    spec = WorkloadSpec(name="sessions", arrivals="replay", replay_trace=_session_replay(tmp_path, 0.5),
+                        dummy_exec_ms=0.05, num_blocks=400)
+    episode, sessions = _session_records(FrontierSchedulingEnv(spec))
+    assert len(episode.requests) == 24 and all(r.completed_at is not None for r in episode.requests)
+    for calls in sessions:
+        assert calls[0].arrived_at == 0.0
+        for previous, call in zip(calls, calls[1:]):
+            # released exactly think_time after the previous call completes
+            assert call.arrived_at == pytest.approx(previous.completed_at + 0.5)
+    # different sessions are independent: their first calls arrive together
+    assert sum(calls[0].arrived_at == 0.0 for calls in sessions) == 6
+
+
+def test_open_loop_rows_without_think_time_keep_trace_arrivals(tmp_path):
+    spec = WorkloadSpec(name="sessions", arrivals="replay", replay_trace=_session_replay(tmp_path, None),
+                        dummy_exec_ms=0.05, num_blocks=400)
+    episode, _ = _session_records(FrontierSchedulingEnv(spec))
+    assert all(r.arrived_at == 0.0 for r in episode.requests)
+
+
+def test_session_workloads_replay_closed_loop_with_prefix_caching(tmp_path):
+    import pandas as pd
+
+    trace = []
+    for session in range(40):
+        for step in range(6):
+            trace.append({
+                "arrived_at": 1000.0 * session + 3.0 * step, "completed_at": 1000.0 * session + 3.0 * step + 1.0,
+                "session_id": session, "step": step, "num_prefill_tokens": 16 * (20 + 10 * step),
+                "num_decode_tokens": 20,
+                "block_hash_ids": f"{session * 1000}-{session * 1000 + 19 + 10 * step}",
+            })
+    path = tmp_path / "trace.csv"
+    pd.DataFrame(trace).to_csv(path, index=False)
+    spec = WorkloadSpec(name="sessions", arrivals="sessions", session_trace=str(path), num_requests=60,
+                        qps=2.0, dummy_exec_ms=0.05, num_blocks=2000, enable_prefix_caching=True)
+    env = FrontierSchedulingEnv(spec, output_dir=str(tmp_path / "out"))
+    episode, sessions = _session_records(env)
+    assert len(episode.requests) == 60
+    for calls in sessions:
+        for previous, call in zip(calls, calls[1:]):
+            assert call.arrived_at == pytest.approx(previous.completed_at + 2.0)  # 3 s apart, 1 s long
+    # later calls reuse the session's earlier prompt blocks
+    assert sum(r.num_cached_prefill_tokens for r in episode.requests) > 0
+
+
+@pytest.mark.parametrize("cover_output", [False, True])
+def test_output_blocks_are_cached_when_trace_ids_cover_them(tmp_path, cover_output):
+    import pandas as pd
+
+    # call 1's prompt is call 0's prompt (20 blocks) + its output (64 tokens,
+    # 4 blocks) + 2 new blocks; call 0's ids name its output's blocks too
+    rows = [
+        {"arrived_at": 0.0, "session_id": 0, "step": 0, "num_prefill_tokens": 320,
+         "num_decode_tokens": 64, "block_hash_ids": "0-23", "think_time": None},
+        {"arrived_at": 0.0, "session_id": 0, "step": 1, "num_prefill_tokens": 416,
+         "num_decode_tokens": 16, "block_hash_ids": "0-26", "think_time": 0.5},
+    ]
+    frame = pd.DataFrame(rows)
+    if cover_output:
+        frame["ids_cover_output"] = 1
+    path = tmp_path / "trace.csv"
+    frame.to_csv(path, index=False)
+    spec = WorkloadSpec(name="out", arrivals="replay", replay_trace=str(path), dummy_exec_ms=0.05,
+                        num_blocks=400, enable_prefix_caching=True)
+    episode, sessions = _session_records(FrontierSchedulingEnv(spec, output_dir=str(tmp_path / "o")))
+    second = sessions[0][1]
+    # vLLM caches the output's full blocks: the next call hits prompt + output,
+    # less the block of the last output token, which is sampled but never
+    # written to the cache
+    assert second.num_cached_prefill_tokens == ((320 + 64 - 1) // 16 * 16 if cover_output else 20 * 16)
+
+
+def test_restarts_can_hit_their_own_cached_output(tmp_path):
+    import pandas as pd
+
+    # a KV cache too small for every call's prompt + output: decode victims
+    # restart and look up their prompt and generated blocks
+    rows = []
+    for session in range(8):
+        for step in range(3):
+            prompt = 400 + 300 * step
+            rows.append({
+                "arrived_at": 0.0, "session_id": session, "step": step,
+                "num_prefill_tokens": prompt, "num_decode_tokens": 300,
+                "block_hash_ids": f"{session * 1000}-{session * 1000 + (prompt + 300) // 16 - 1}",
+                "think_time": 0.1 if step else None, "ids_cover_output": 1,
+            })
+    path = tmp_path / "trace.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    spec = WorkloadSpec(name="restarts", arrivals="replay", replay_trace=str(path), dummy_exec_ms=0.05,
+                        num_blocks=160, enable_prefix_caching=True)
+    episode, _ = _session_records(FrontierSchedulingEnv(spec, output_dir=str(tmp_path / "o")))
+    assert all(r.completed_at is not None for r in episode.requests)
+    assert sum(r.num_preemptions for r in episode.requests) > 0

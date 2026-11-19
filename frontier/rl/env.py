@@ -48,18 +48,32 @@ class WorkloadSpec:
     Gamma (cv > 1 is bursty) or, with `replay_trace`, replayed from a CSV
     with arrived_at (and optionally session_id, block_hash_ids,
     thinking_round_plans_json, tool_call_latency) that also gives lengths.
+
+    arrivals="sessions" samples num_requests calls at qps from the session
+    trace `session_trace` (frontier/trace_prep), whole sessions with their
+    own call gaps, the seed choosing sessions and phases; with
+    enable_prefix_caching, calls reuse their session's earlier prompts. With
+    session_closed_loop (default), a session's next call arrives only after
+    its previous call completes (plus the trace's think time).
     """
 
     name: str
     num_requests: int = 300
     qps: float = 10.0
-    arrivals: str = "poisson"  # poisson | gamma | replay
+    arrivals: str = "poisson"  # poisson | gamma | replay | sessions
     cv: float = 1.0
     length_trace: Optional[str] = None
     prefill_tokens: int = 1000
     decode_tokens: int = 200
     replay_trace: Optional[str] = None
     replay_time_scale: float = 1.0
+    # arrivals="sessions" (frontier/trace_prep/sessions.py)
+    session_trace: Optional[str] = None
+    session_time_scale: float = 1.0
+    turn_gap: float = 30.0
+    session_phase: str = "stationary"
+    # a session's next call waits for its previous one (sessions.py)
+    session_closed_loop: bool = True
     max_tokens: int = 4096
     # hardware and engine
     model: str = "llama2_7b_dense_example"
@@ -103,6 +117,10 @@ def simulation_args(
         "--decode_cuda_graph_mode", "none",
         "--random_forrest_execution_time_predictor_config_prediction_max_prefill_chunk_size",
         str(max(spec.max_tokens_in_batch, 1024)),
+        # the predictor's own request-length limit (default 4096) must cover
+        # the workload's requests, e.g. 131072 for 128k-context traces
+        "--random_forrest_execution_time_predictor_config_prediction_max_tokens_per_request",
+        str(max(spec.max_tokens, 4096)),
         "--metrics_config_output_dir", output_dir,
         "--no-metrics_config_write_metrics",
         "--no-metrics_config_store_plots",
@@ -130,11 +148,15 @@ def simulation_args(
     if spec.enable_prefix_caching:
         args += ["--vllm_v1_scheduler_config_enable_prefix_caching"]
 
-    if spec.arrivals == "replay":
-        assert spec.replay_trace, "arrivals=replay needs replay_trace"
+    if spec.arrivals in ("replay", "sessions"):
+        if spec.arrivals == "sessions":
+            replay_trace = session_workload_trace(spec, seed, output_dir)
+        else:
+            assert spec.replay_trace, "arrivals=replay needs replay_trace"
+            replay_trace = spec.replay_trace
         args += [
             "--request_generator_config_type", "trace_replay",
-            "--trace_request_generator_config_trace_file", spec.replay_trace,
+            "--trace_request_generator_config_trace_file", replay_trace,
             "--trace_request_generator_config_time_scale_factor", str(spec.replay_time_scale),
             "--trace_request_generator_config_max_tokens", str(spec.max_tokens),
             "--trace_request_generator_config_seed", str(seed),
@@ -178,6 +200,37 @@ def simulation_args(
     return args + list(spec.extra_args)
 
 
+def session_workload_trace(spec: WorkloadSpec, seed: int, output_dir: str) -> str:
+    """The CSV that arrivals="sessions" replays for this seed, sampled once
+    and kept under output_dir/session_workloads."""
+    import hashlib
+
+    from frontier.trace_prep import synthetic
+    from frontier.trace_prep.sessions import sample_named_workload, write_session_workload
+
+    assert spec.session_trace, "arrivals=sessions needs session_trace"
+    trace = spec.session_trace if synthetic.is_synthetic(spec.session_trace) else os.path.abspath(spec.session_trace)
+    params = (
+        trace, spec.num_requests, spec.qps, seed, spec.max_tokens,
+        spec.session_time_scale, spec.turn_gap, spec.session_phase,
+        spec.session_closed_loop,
+    )
+    key = hashlib.sha1(repr(params).encode()).hexdigest()[:16]
+    directory = os.path.join(os.path.abspath(output_dir), "session_workloads")
+    path = os.path.join(directory, f"{key}.csv")
+    if not os.path.exists(path):
+        os.makedirs(directory, exist_ok=True)
+        workload = sample_named_workload(
+            trace, spec.num_requests, spec.qps, seed, spec.max_tokens,
+            session_time_scale=spec.session_time_scale,
+            turn_gap=spec.turn_gap,
+            phase=spec.session_phase,
+            closed_loop=spec.session_closed_loop,
+        )
+        write_session_workload(path, workload)
+    return path
+
+
 def make_simulation_config(
     spec: WorkloadSpec, seed: int, output_dir: str, log_level: str = "error"
 ):
@@ -212,6 +265,8 @@ _PREDICTORS: Dict[Tuple, Dict[Any, Any]] = {}
 _WORKLOAD_FIELDS = {
     "name", "num_requests", "qps", "arrivals", "cv", "length_trace",
     "prefill_tokens", "decode_tokens", "replay_trace", "replay_time_scale",
+    "session_trace", "session_time_scale", "turn_gap", "session_phase",
+    "session_closed_loop",
 }
 
 

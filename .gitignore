@@ -260,3 +260,8 @@ skills/*/site.local.md
 
 # RL run outputs (frontier/rl)
 rl_runs/
+
+# raw session-trace downloads (frontier/trace_prep/README.md) and rebuild backups
+data/raw_traces/freeinference_2026-08-30/
+data/raw_traces/tracelab/
+data/processed_traces/*.prev.csv

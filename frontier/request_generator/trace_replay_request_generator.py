@@ -3,30 +3,30 @@ import math
 import json
 from typing import List
 
+import numpy as np
 import pandas as pd
 
 from frontier.config import TraceRequestGeneratorConfig
 from frontier.entities import Request, RequestRoundPlan
 from frontier.request_generator.base_request_generator import BaseRequestGenerator
+from frontier.utils.block_hash_ids import decode_block_hash_ids
 
 logger = logging.getLogger(__name__)
 
 
-def _parse_block_hash_ids(value) -> list[int] | None:
+def _parse_block_hash_ids(value) -> np.ndarray | None:
+    """Ids from a trace cell: runs "a-b|c" (frontier/utils/block_hash_ids.py),
+    or plain "|"/","-separated ids."""
     if value is None:
         return None
     if isinstance(value, float) and math.isnan(value):
         return None
     if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
+        if not value.strip():
             return None
-        if stripped.startswith("[") and stripped.endswith("]"):
-            stripped = stripped[1:-1]
-        delimiter = "|" if "|" in stripped else ","
-        return [int(part.strip()) for part in stripped.split(delimiter) if part.strip()]
-    if isinstance(value, int):
-        return [int(value)]
+        return decode_block_hash_ids(value)
+    if isinstance(value, (int, np.integer)):
+        return np.array([int(value)], dtype=np.int64)
     raise ValueError(f"Unsupported block_hash_ids value: {value!r}")
 
 
@@ -156,6 +156,15 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
                 )
         diff_tokens = total_tokens - config.max_tokens
         diff_tokens = diff_tokens.clip(lower=0)
+        # ids past a prompt name its output's blocks (frontier/trace_prep) only
+        # while lengths are the trace's
+        if "ids_cover_output" in self.trace_df.columns:
+            self.trace_df["ids_cover_output"] = (
+                self.trace_df["ids_cover_output"].fillna(0).astype(int).astype(bool)
+                & (diff_tokens == 0)
+                & (config.prefill_scale_factor == 1)
+                & (config.decode_scale_factor == 1)
+            )
         self.trace_df["num_prefill_tokens"] = (
             self.trace_df["num_prefill_tokens"] - diff_tokens
         )
@@ -199,6 +208,7 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
             row_thinking_round_plans = _parse_thinking_round_plans(
                 row.get("thinking_round_plans_json")
             )
+            think_time = _parse_optional_float(row.get("think_time"))
 
             if (
                 row_thinking_depth is None
@@ -214,6 +224,8 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
                     session_id=session_id,
                     cohort=cohort,
                 )
+                request.think_time = think_time
+                request.block_hash_ids_cover_output = bool(row.get("ids_cover_output", False))
                 requests.append(request)
                 continue
 
@@ -249,6 +261,8 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
                 tool_call_latency=row_tool_call_latency,
                 thinking_round_plans=row_thinking_round_plans,
             )
+            request.think_time = think_time
+            request.block_hash_ids_cover_output = bool(row.get("ids_cover_output", False))
 
             requests.append(request)
 

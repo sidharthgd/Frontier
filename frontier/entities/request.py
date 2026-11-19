@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from typing import NamedTuple, Tuple, Dict, List, Optional, Sequence
 from collections import defaultdict
 
+import numpy as np
+
 from frontier.entities.base_entity import BaseEntity
 from frontier.logger import init_logger
 from frontier.types import ClusterType
@@ -92,10 +94,24 @@ class Request(BaseEntity):
         self._num_decode_tokens = resolved_round_plans[0].num_decode_tokens
         self._num_processed_tokens = num_processed_tokens
         self._priority = priority  # Lower value = higher priority (matches vLLM v1)
+        # int64 array: agentic prompts reach ~10k blocks per request, which
+        # as a Python list costs ~35 bytes a block against 8 here
         self._block_hash_ids = (
-            list(block_hash_ids) if block_hash_ids is not None else None
+            np.array(block_hash_ids, dtype=np.int64)
+            if block_hash_ids is not None
+            else None
         )
         self._session_id = session_id
+        # Closed-loop sessions: seconds between the previous call of this
+        # session completing and this call arriving. Set (by trace replay)
+        # only on a session's later calls; the simulator then holds the call
+        # back and releases it on that completion (Simulator._init_event_queue).
+        self.think_time: Optional[float] = None
+        # The ids past the prompt's name the full blocks its output completes
+        # (frontier/trace_prep: (prompt + output) // block_size ids). Then the
+        # output's blocks are cached as they are decoded and a restart looks
+        # them up, as vLLM does with generated tokens; set by trace replay.
+        self.block_hash_ids_cover_output = False
         self._cohort = cohort
         self._num_prefill_tokens_cached = 0
 
@@ -517,7 +533,9 @@ class Request(BaseEntity):
 
     @property
     def block_hash_ids(self) -> Optional[List[int]]:
-        return self._block_hash_ids
+        if self._block_hash_ids is None:
+            return None
+        return self._block_hash_ids.tolist()
 
     def prompt_block_hash_ids(self, block_size: int) -> List[int]:
         """Hashes of the full blocks of the active round's prompt.
@@ -527,7 +545,33 @@ class Request(BaseEntity):
         shortened, name no tokens of this request: they are neither looked up
         nor bound to its decode-token blocks.
         """
-        return list(self._block_hash_ids or [])[: self._num_prefill_tokens // block_size]
+        if self._block_hash_ids is None:
+            return []
+        return self._block_hash_ids[: self._num_prefill_tokens // block_size].tolist()
+
+    def lookup_block_hash_ids(self, block_size: int) -> List[int]:
+        """Hashes a prefix-cache lookup for this request queries: its prompt's,
+        or, for a restart of a request whose ids cover its output, those of
+        every full block it had computed (vLLM's request.block_hashes)."""
+        return self.lookup_block_hash_array(block_size).tolist()
+
+    def lookup_block_hash_array(self, block_size: int) -> np.ndarray:
+        """lookup_block_hash_ids as an int64 array view (no copy)."""
+        if self._block_hash_ids is None:
+            return np.zeros(0, dtype=np.int64)
+        if self.block_hash_ids_cover_output and self.is_recomputing:
+            return self._block_hash_ids[: int(self.num_processed_tokens) // block_size]
+        return self._block_hash_ids[: self._num_prefill_tokens // block_size]
+
+    def bind_block_hash_ids(self, block_size: int) -> List[int]:
+        """Hashes its full blocks are cached under as they are computed: the
+        prompt's, plus the output's when the ids cover it."""
+        if self._block_hash_ids is None:
+            return []
+        if self.block_hash_ids_cover_output:
+            total = (self._num_prefill_tokens + self._num_decode_tokens) // block_size
+            return self._block_hash_ids[:total].tolist()
+        return self.prompt_block_hash_ids(block_size)
 
     @property
     def session_id(self) -> Optional[int]:
@@ -550,7 +594,12 @@ class Request(BaseEntity):
         # for Prefix-cache re-admission, so allow that one recovery transition.
         if self._scheduled and not self._preempted:
             raise ValueError(f"Request {self._id} already scheduled.")
-        if num_tokens_cached < 0 or num_tokens_cached > self._num_prefill_tokens:
+        # A restart recomputes its prompt and generated tokens; with ids that
+        # cover its output (lookup_block_hash_ids) its hit can reach into them.
+        limit = self._num_prefill_tokens
+        if self._num_recomputed_tokens is not None and self.block_hash_ids_cover_output:
+            limit = max(limit, int(self._num_processed_tokens))
+        if num_tokens_cached < 0 or num_tokens_cached > limit:
             raise ValueError(
                 f"Invalid cached token count for request {self._id}: {num_tokens_cached}"
             )
@@ -1734,7 +1783,7 @@ class Request(BaseEntity):
             "completed_thinking_rounds": self._completed_thinking_rounds,
             "num_processed_tokens": self._num_processed_tokens,
             "num_prefill_tokens_cached": self._num_prefill_tokens_cached,
-            "block_hash_ids": self._block_hash_ids,
+            "block_hash_ids": self.block_hash_ids,
             "session_id": self._session_id,
             "cohort": self._cohort,
             "scheduled": self._scheduled,

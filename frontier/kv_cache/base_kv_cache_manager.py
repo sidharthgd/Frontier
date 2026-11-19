@@ -95,11 +95,77 @@ class KVCacheManager:
             field="scheduler_num_computed_tokens",
         )
 
+    def peek_cached_prefix_tokens(self, request: Request) -> int:
+        """Prompt tokens a prefix-cache hit would save if the request were
+        admitted now: get_computed_blocks without touching its stats, capped
+        like admission (vLLM computes at least the last prompt token)."""
+        return self.peek_prefix_cache(request)[0]
+
+    def peek_prefix_cache(self, request: Request, chained: bool = False) -> tuple[int, int]:
+        """(cached prompt tokens, idle cached blocks) for a waiting request,
+        read without touching stats or eviction order. Cached tokens are as
+        in peek_cached_prefix_tokens. Idle blocks are those of the hit that no
+        running request holds: they sit in the free queue, so admission takes
+        them out of it (can_allocate_slots counts them against free blocks).
+
+        chained=True says the request's ids are chained (id k names the whole
+        prefix through block k, as vLLM's hashes and frontier/trace_prep's ids
+        are) and finds both by binary search instead of a scan."""
+        if not chained:
+            return self._peek_prefix_cache_scan(request)
+        # _block_hash_ids: the block_hash_ids property copies every id to a list
+        if not self.enable_caching or getattr(request, "_block_hash_ids", None) is None:
+            return 0, 0
+        cached = self.block_pool.cached_block_hash_to_block
+        target = (
+            request.num_processed_tokens
+            if request.is_recomputing
+            else request.num_prefill_tokens
+        )
+        limit = max(int(target) - 1, 0) // self.block_size
+        hashes = request.lookup_block_hash_array(self.block_size)[:limit]
+
+        def block(i):
+            # the copy admission would reuse (BlockPool.get_cached_block)
+            blocks = cached.get(int(hashes[i]))
+            if not blocks:
+                return None
+            return next(iter(blocks.values())) if len(blocks) == 1 else blocks[min(blocks)]
+
+        # With chained ids both sets below are prefixes of the request's
+        # blocks, so binary searches find them in O(log blocks) lookups (a
+        # scan of an agentic prompt is ~8k): requests hold their blocks from
+        # block 0 and free them tail first into an LRU queue, so a chain is
+        # evicted from its end, and a cached id implies its whole prefix was
+        # computed. Unchained ids (a cached block after a miss) need the scan.
+        num_blocks = _prefix_length(len(hashes), lambda i: block(i) is not None)
+        held = _prefix_length(num_blocks, lambda i: block(i).ref_cnt > 0)
+        return num_blocks * self.block_size, num_blocks - held
+
+    def _peek_prefix_cache_scan(self, request: Request) -> tuple[int, int]:
+        """peek_prefix_cache by a linear scan of the request's blocks."""
+        if not self.enable_caching or getattr(request, "_block_hash_ids", None) is None:
+            return 0, 0
+        target = (
+            request.num_processed_tokens
+            if request.is_recomputing
+            else request.num_prefill_tokens
+        )
+        limit = max(int(target) - 1, 0) // self.block_size
+        num_blocks = idle = 0
+        for block_hash in request.lookup_block_hash_ids(self.block_size)[:limit]:
+            block = self.block_pool.get_cached_block(block_hash)
+            if block is None:
+                break
+            num_blocks += 1
+            idle += block.ref_cnt == 0
+        return num_blocks * self.block_size, idle
+
     def get_computed_blocks(self, request: Request) -> tuple[list[KVCacheBlock], int]:
         if not self.enable_caching:
             return [], 0
 
-        block_hashes = request.prompt_block_hash_ids(self.block_size)
+        block_hashes = request.lookup_block_hash_ids(self.block_size)
         computed_blocks: list[KVCacheBlock] = []
         for block_hash in block_hashes:
             cached_block = self.block_pool.get_cached_block(block_hash)
@@ -213,7 +279,7 @@ class KVCacheManager:
         num_cached_blocks = self.num_cached_blocks.get(request.id, len(computed_blocks))
         new_bindings = self.block_pool.cache_full_blocks(
             blocks=request_blocks,
-            block_hashes=request.prompt_block_hash_ids(self.block_size),
+            block_hashes=request.bind_block_hash_ids(self.block_size),
             num_cached_blocks=num_cached_blocks,
             num_full_blocks=num_full_blocks,
             creator_request_id=request.id,
@@ -234,3 +300,16 @@ class KVCacheManager:
 
     def free_block_hashes(self, request: Request) -> None:
         self.num_cached_blocks.pop(request.id, None)
+
+
+def _prefix_length(n: int, holds) -> int:
+    """The largest k <= n with holds(i) for every i < k, for a predicate
+    that holds on a prefix of range(n)."""
+    low, high = 0, n
+    while low < high:
+        mid = (low + high + 1) // 2
+        if holds(mid - 1):
+            low = mid
+        else:
+            high = mid - 1
+    return low

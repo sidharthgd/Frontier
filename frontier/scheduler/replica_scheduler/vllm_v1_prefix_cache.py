@@ -83,7 +83,7 @@ class PrefixCacheLedger:
         )
         raw_hit_blocks = tuple(computed_blocks)
         raw_hit_bindings: list[KVCacheBlockBinding] = []
-        query_hashes = request.prompt_block_hash_ids(int(self._config.block_size))
+        query_hashes = request.lookup_block_hash_ids(int(self._config.block_size))
         for query_index, block in enumerate(raw_hit_blocks):
             binding = block.binding
             if binding is None:
@@ -173,7 +173,7 @@ class PrefixCacheLedger:
         request: Request,
         bindings: Sequence[KVCacheBlockBinding],
     ) -> List[Dict[str, Any]]:
-        query_hashes = request.prompt_block_hash_ids(int(self._config.block_size))
+        query_hashes = request.lookup_block_hash_ids(int(self._config.block_size))
         if len(bindings) > len(query_hashes):
             raise ValueError(
                 "Prefix cache hit count exceeds the ordered query hash count."
@@ -210,7 +210,7 @@ class PrefixCacheLedger:
             )
             admission_payload.update(
                 {
-                    "query_hashes": request.prompt_block_hash_ids(
+                    "query_hashes": request.lookup_block_hash_ids(
                         int(self._config.block_size)
                     ),
                     "raw_hit_blocks": self._serialize_prefix_cache_hit_bindings(

@@ -257,6 +257,8 @@ class MetricsStore:
         self._total_requests = 0
         self._completed_requests = 0
         self._completed_request_ids = set()
+        # called once per request, at its completion (closed-loop sessions)
+        self.request_end_listeners = []
 
         self._cluster_configs = cluster_configs
 
@@ -2921,6 +2923,8 @@ class MetricsStore:
         ):
             self._completed_request_ids.add(request.id)
             self._completed_requests += 1
+            for listener in getattr(self, "request_end_listeners", ()):
+                listener(time, request)
 
         if not self._config.store_request_metrics:
             return
