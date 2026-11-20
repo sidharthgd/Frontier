@@ -1,46 +1,48 @@
-- name: tracelab_c12
+- name: tracelab_c8
   trace: tracelab
   arrivals: sessions
   num_requests: 300
   num_blocks: 28318
   gap_metric: false
-  simulation: &id002
+  simulation: &sim8
     max_tokens: 131072
-    session_concurrency: 12
+    session_concurrency: 8
+    max_think_time: 600
     session_warmup: 600
   backend: frontier
-  frontier: &id001
+  frontier: &frontier
     # as configs/rl/frontier_concurrency.yaml (piecewise CUDA graphs)
     preset: a100_llama31_8b
     prediction_rounding_bits: 5
     enable_prefix_caching: true
-- name: tracelab_c20
+- name: tracelab_c10
   trace: tracelab
   arrivals: sessions
   num_requests: 300
   num_blocks: 28318
   gap_metric: false
-  simulation: &id003
+  simulation: &sim10
     max_tokens: 131072
-    session_concurrency: 20
+    session_concurrency: 10
     session_warmup: 600
+    max_think_time: 600
   backend: frontier
-  frontier: *id001
-- name: freeinference_c12
+  frontier: *frontier
+- name: freeinference_c8
   trace: freeinference
   arrivals: sessions
   num_requests: 300
   num_blocks: 28318
   gap_metric: false
-  simulation: *id002
+  simulation: *sim8
   backend: frontier
-  frontier: *id001
-- name: freeinference_c20
+  frontier: *frontier
+- name: freeinference_c10
   trace: freeinference
   arrivals: sessions
   num_requests: 300
   num_blocks: 28318
   gap_metric: false
-  simulation: *id003
+  simulation: *sim10
   backend: frontier
-  frontier: *id001
+  frontier: *frontier

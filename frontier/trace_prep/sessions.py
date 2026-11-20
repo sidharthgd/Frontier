@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -305,12 +305,13 @@ def sample_named_workload(
     qps: float,
     seed: int = 0,
     max_tokens: Optional[int] = None,
+    load_range: Optional[Tuple[float, float]] = None,
     **kwargs,
 ) -> pd.DataFrame:
     """sample_session_workload from a session trace file, or from synthetic
     sessions generated for this seed when trace is "synthetic:<preset>" or
     "synthetic:random" (frontier/trace_prep/synthetic.py; random also scales
-    qps, or concurrency, by its drawn load multiplier)."""
+    qps, or concurrency, by its drawn load multiplier, from load_range)."""
     import dataclasses
     import os
 
@@ -323,11 +324,12 @@ def sample_named_workload(
             k: v for k, v in kwargs.items() if k in ("session_time_scale", "turn_gap", "session_gap", "max_think_time")
         }
     if not synthetic.is_synthetic(trace):
+        assert load_range is None, "load_range needs a synthetic:random trace"
         sessions = load_session_trace(os.path.abspath(trace), max_tokens)
         if concurrency:
             return sample_concurrent_workload(sessions, num_requests, concurrency, seed, **concurrent_kwargs)
         return sample_session_workload(sessions, num_requests, qps, seed, **kwargs)
-    params, load = synthetic.synthetic_params(trace, seed)
+    params, load = synthetic.synthetic_params(trace, seed, load_range)
     while concurrency:
         # random's load multiplier scales the number of agents
         sessions = sessions_from_frame(synthetic.generate_session_frame(params, seed), max_tokens)

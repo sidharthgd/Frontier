@@ -24,7 +24,7 @@ import math
 import os
 import random
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -120,6 +120,9 @@ class SessionTraceRequestGeneratorConfig:
     # with session_concurrency: cap on the think time between a session's
     # calls (sessions.sample_concurrent_workload; None = the trace's)
     max_think_time: Optional[float] = None
+    # synthetic:random: (low, high) of its log-uniform load multiplier on qps
+    # or session_concurrency (frontier/trace_prep/synthetic.py; None = 0.5-2x)
+    load_range: Optional[Tuple[float, float]] = None
 
 
 @dataclass
@@ -426,6 +429,7 @@ def _session_requests(config: SessionTraceRequestGeneratorConfig) -> List[Worklo
             turn_gap=config.turn_gap,
             session_gap=config.session_gap,
             max_think_time=config.max_think_time,
+            load_range=config.load_range,
         )
     else:
         workload = sessions.sample_named_workload(
@@ -438,6 +442,7 @@ def _session_requests(config: SessionTraceRequestGeneratorConfig) -> List[Worklo
             turn_gap=config.turn_gap,
             phase=config.session_phase,
             closed_loop=config.session_closed_loop,
+            load_range=config.load_range,
             **({"warmup": config.session_warmup} if config.session_warmup else {}),
         )
     requests = []
@@ -531,6 +536,7 @@ def make_request_generator_config(
     session_concurrency: int = 0,
     session_gap: float = 30.0,
     max_think_time: Optional[float] = None,
+    load_range: Optional[Tuple[float, float]] = None,
 ):
     """
     The workload: request lengths from `trace_file` (a TRACE_FILES name or a
@@ -561,8 +567,10 @@ def make_request_generator_config(
             session_concurrency=session_concurrency,
             session_gap=session_gap,
             max_think_time=max_think_time,
+            load_range=load_range,
         )
     assert max_think_time is None, "max_think_time needs arrivals=sessions"
+    assert load_range is None, "load_range needs arrivals=sessions"
     trace_file = _trace_file(trace_file)
     if arrivals == "trace":
         return TraceWindowRequestGeneratorConfig(
@@ -613,6 +621,7 @@ def make_simulation_config(
     session_concurrency: int = 0,
     session_gap: float = 30.0,
     max_think_time: Optional[float] = None,
+    load_range: Optional[Tuple[float, float]] = None,
 ) -> SimulationConfig:
     """
     Single-replica config with the workload from make_request_generator_config
@@ -654,6 +663,7 @@ def make_simulation_config(
             session_concurrency=session_concurrency,
             session_gap=session_gap,
             max_think_time=max_think_time,
+            load_range=load_range,
         ),
         metrics_config=MetricsConfig(output_dir=output_dir),
     )

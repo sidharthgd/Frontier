@@ -387,3 +387,16 @@ def test_randomized_synthetic_workloads_differ_by_seed():
     c = sessions.sample_named_workload("synthetic:random", 100, 1.0, seed=0)
     assert len(a) == len(b) == 100 and a.equals(c) and not a.equals(b)
     assert a["think_time"].notna().any() and (a["ids_cover_output"] == 1).all()
+
+
+def test_synthetic_load_range_scales_only_the_load():
+    from frontier.trace_prep import synthetic
+
+    for seed in range(20):
+        params, load = synthetic.synthetic_params("synthetic:random", seed)
+        narrow_params, narrow = synthetic.synthetic_params("synthetic:random", seed, (0.8, 1.25))
+        assert narrow_params == params and 0.8 <= narrow <= 1.25
+        # the same draw, mapped from log-uniform 0.5-2x onto 0.8-1.25x
+        u = np.log(load / 0.5) / np.log(4.0)
+        assert np.isclose(narrow, 0.8 * (1.25 / 0.8) ** u)
+    assert synthetic.synthetic_params("synthetic:tracelab", 0, (0.8, 1.25))[1] == 1.0

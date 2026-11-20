@@ -242,14 +242,20 @@ def generate_session_frame(params: AgentSessionParams, seed: int) -> pd.DataFram
     return frame
 
 
-def synthetic_params(name: str, seed: int) -> Tuple[AgentSessionParams, float]:
+def synthetic_params(
+    name: str, seed: int, load_range: Optional[Tuple[float, float]] = None
+) -> Tuple[AgentSessionParams, float]:
     """Parameters for "synthetic:<preset>" or "synthetic:random", and the
-    load multiplier: random also draws the offered load (qps) from 0.5x to
-    2x the workload's, log-uniform."""
+    load multiplier: random also draws the offered load (qps, or the number
+    of agents) from load_range (default 0.5x to 2x) times the workload's,
+    log-uniform. The draw has its own random stream, so load_range changes
+    only the load, not the sessions."""
     kind = name.split(":", 1)[1] if ":" in name else "random"
     if kind == "random":
+        low, high = load_range or (0.5, 2.0)
+        assert 0 < low <= high, f"load_range {load_range}"
         rng = np.random.default_rng([seed, 0x10AD])
-        return randomized_params(seed), float(np.exp(rng.uniform(np.log(0.5), np.log(2.0))))
+        return randomized_params(seed), float(np.exp(rng.uniform(np.log(low), np.log(high))))
     if kind not in PRESETS:
         raise ValueError(f"unknown synthetic preset {kind!r}: {sorted(PRESETS)} or random")
     return PRESETS[kind], 1.0

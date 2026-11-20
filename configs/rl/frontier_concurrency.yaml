@@ -7,9 +7,26 @@
 # of warm-up, then each agent's first ceil(num_requests / N) calls are scored
 # and the episode stops once they finish (frontier/rl/frontier_env.py), so a
 # policy that starves an agent cannot shrink that agent's share of the score.
-# Train: synthetic:random, base 18 agents x a 0.5-2x load draw (9-36 agents;
-# FCFS mean TTFT 1-200 s over 8 seeds). Eval: TraceLab / FreeInference at 12
-# and 20 agents (FCFS mean TTFT 23-124 s).
+# Think time between a session's calls is capped at 600 s (max_think_time):
+# the traces have gaps of up to ~7 days, and an agent parked on one stalls
+# its scored quota while the other agents keep generating unscored calls.
+# Train: synthetic:random, base 18 agents x a 0.8-1.25x load draw (14-22
+# agents). Eval: TraceLab / FreeInference at 8 and 10 agents.
+# Agent-count sweep (2026-11-19, 600 s cap, FCFS vs age200; mean over seeds):
+#                 restarts/call  prefix hit  FCFS TTFT  age200 TTFT / e2e_norm gain
+#   TraceLab  c8       0.03         0.82        4.8 s        14% / 7%
+#             c10      0.20         0.64         16 s        27% / 14%
+#             c12      0.50         0.30         43 s        30% / 13%  (thrashing)
+#   synthetic c10      0.002        0.91        1.4 s        -3% / -2%
+#             c14      0.08         0.81        5.1 s        13% / 2%
+#             c18      0.16         0.67         11 s        24% / 15%
+#             c22-24   0.36         0.46         29 s        30% / 13%  (thrashing)
+# Synthetic sessions are lighter than the real traces at the same agent
+# count, so training runs ~1.8x the eval agents to match their contention;
+# below ~14 there is little for SJF to win. FreeInference c8 is roughly
+# FCFS-optimal (age200 -11% TTFT gain), c10 +36%. Episode wall time is ~flat
+# in agent count (bigger batches, fewer steps).
+# The reward weights below were chosen at the earlier 12/20-agent eval points.
 #
 # Reward and teacher from the weight check (2026-11-18; 6 baselines, real
 # traces at 12/20 agents x 3 seeds, synthetic x 8 seeds). Improvement over FCFS
@@ -44,6 +61,8 @@ workloads:
     max_tokens: 131072
     session_concurrency: 18
     session_warmup: 600
+    max_think_time: 600
+    load_range: [0.8, 1.25]
   backend: frontier
   frontier: &frontier
     # A100 + Llama-3.1-8B as validated against vLLM (frontier/rl/engine.py
@@ -54,46 +73,48 @@ workloads:
     prediction_rounding_bits: 5
     enable_prefix_caching: true
 eval_workloads:
-- name: tracelab_c12
+- name: tracelab_c8
   trace: tracelab
   arrivals: sessions
   num_requests: 300
   num_blocks: 28318
   gap_metric: false
-  simulation: &sim12
+  simulation: &sim8
     max_tokens: 131072
-    session_concurrency: 12
+    session_concurrency: 8
     session_warmup: 600
+    max_think_time: 600
   backend: frontier
   frontier: *frontier
-- name: tracelab_c20
+- name: tracelab_c10
   trace: tracelab
   arrivals: sessions
   num_requests: 300
   num_blocks: 28318
   gap_metric: false
-  simulation: &sim20
+  simulation: &sim10
     max_tokens: 131072
-    session_concurrency: 20
+    session_concurrency: 10
     session_warmup: 600
+    max_think_time: 600
   backend: frontier
   frontier: *frontier
-- name: freeinference_c12
+- name: freeinference_c8
   trace: freeinference
   arrivals: sessions
   num_requests: 300
   num_blocks: 28318
   gap_metric: false
-  simulation: *sim12
+  simulation: *sim8
   backend: frontier
   frontier: *frontier
-- name: freeinference_c20
+- name: freeinference_c10
   trace: freeinference
   arrivals: sessions
   num_requests: 300
   num_blocks: 28318
   gap_metric: false
-  simulation: *sim20
+  simulation: *sim10
   backend: frontier
   frontier: *frontier
 observation:
