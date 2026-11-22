@@ -238,3 +238,9 @@ class without giving up the mean. CDF loop paused until it finishes (memory).
   sq0.01 @20: e2e on a par with linear w = 1 (FI mean 55.3 s), p100 366 / 366 s. So every policy so far trades e2e for starvation; none beats rel30 on
   both. Stopped `ppo_pure_e2e_sq0.01` at iteration 34 (evals +0.001 / +0.023 / −0.069; best @20); replaced by **`ppo_pure_e2e_sq0.05`** (same, starvation weight 0.05;
   at that weight every heuristic is at or below FCFS on synthetic, so collapse to FCFS is possible).
+- **2026-11-22 19:24–21:07 UTC: final 18-seed evaluation** (`final_eval18/`). All training stopped first (`ppo_pure_e2e_sq0.02` at iteration ~135,
+  `ppo_pure_e2e_sq0.05` at ~85). 33 policies (4 heuristics plus every run's `best.pt` and `latest.pt`) × 4 eval workloads × 18 seeds,
+  per call (`scripts/rl/ttft_tail_anatomy.py`, 100 workers). Tables: `final_eval18/tables.txt`, `headtohead.txt`. Write-up: **`RESULTS.md`**.
+  Pure PPO e2e + 1×hinge is the fastest policy on e2e at c10: TL −13% median / −10% p99 / −12% mean vs FCFS, and −4 to −8% vs age200 / rel30
+  (paired intervals exclude 0). It beats plain SJF on the mean and ties it on the median, with a worst TTFT of 447–484 s against SJF's 844–2,023 s.
+  The mechanism is cache locality: hit rate 78% vs 75% (FCFS) and 76–77% (heuristics). At c8 everything is within ±2% of FCFS.
