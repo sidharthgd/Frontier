@@ -75,6 +75,11 @@ class TrainConfig:
     imitation: Dict[str, Any] = field(default_factory=dict)
     # start PPO from these model weights (e.g. an imitation checkpoint)
     init_checkpoint: Optional[str] = None
+    # continue a PPO run from one of its checkpoints (e.g. <output_dir>/latest.pt,
+    # to run past its original `iterations`): model, optimizer, return
+    # normalization, iteration count and best eval score. The task sampler
+    # restarts from `seed` advanced by the iteration count, not the exact stream.
+    resume_checkpoint: Optional[str] = None
     num_priority_levels: int = 16
 
     iterations: int = 200
@@ -82,6 +87,23 @@ class TrainConfig:
     group_size: int = 4
     # None: all cores but two; 0: in-process
     num_workers: Optional[int] = None
+    # spread each (workload, seed) group's rollouts over workers (each reruns
+    # the FCFS reference): less wall time per iteration when cores are spare
+    split_groups: bool = False
+    # workers fork from one process holding the execution-time predictors
+    # (frontier/rl/preload.py) instead of each building them: ~7 GB less RAM
+    # per worker for the a100_llama31_8b preset
+    share_predictors: bool = False
+    # cache reference episodes (FCFS etc.) on disk here, shared by workers and
+    # by runs with the same workloads (e.g. eval FCFS runs once in total)
+    reference_cache_dir: Optional[str] = None
+    # extra workers that run the next iteration's FCFS references during the
+    # current rollouts (needs reference_cache_dir): an iteration then waits on
+    # ~1 episode instead of 2. Each takes about 2 FCFS runs per iteration, so
+    # ~seeds_per_iteration / 2 is enough. Draws each iteration's tasks one
+    # iteration early, so runs differ from prefetch_workers=0 ones (same
+    # algorithm, another random stream).
+    prefetch_workers: int = 0
     eval_every: int = 10
     eval_decodings: List[str] = field(
         default_factory=lambda: ["rank", "argmax", "sample"]
@@ -243,6 +265,23 @@ class Trainer:
         self.return_std = RunningStd()
         self.iteration = 0
         self.best_eval = -float("inf")
+        if config.resume_checkpoint:
+            checkpoint = torch.load(
+                config.resume_checkpoint, map_location="cpu", weights_only=False
+            )
+            assert (
+                ModelConfig(**checkpoint["model_config"]) == self.model_config
+            ), "resume_checkpoint has a different model config"
+            self.model.load_state_dict(checkpoint["model"])
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            self.return_std.load_state_dict(checkpoint["return_std"])
+            self.iteration = checkpoint["iteration"]
+            self.best_eval = checkpoint["best_eval"]
+            if checkpoint["train_config"].get("eval_seeds") != config.eval_seeds:
+                # a score on other seeds is not comparable: best.pt restarts
+                print("eval seeds changed: best.pt is picked among new evals only", flush=True)
+                self.best_eval = -float("inf")
+            self.rng = np.random.default_rng((config.seed, self.iteration))
 
         num_workers = (
             default_num_workers() if config.num_workers is None else config.num_workers
@@ -255,6 +294,10 @@ class Trainer:
             self.model_config,
             os.path.join(config.output_dir, "sim"),
             num_workers,
+            config.split_groups,
+            config.share_predictors,
+            config.reference_cache_dir,
+            config.prefetch_workers,
         )
         self.metrics_file = open(os.path.join(config.output_dir, "metrics.jsonl"), "a")
         self.wandb = None
@@ -340,10 +383,22 @@ class Trainer:
 
     def train(self) -> None:
         config = self.config
+        next_tasks = None
+        first = True
         while self.iteration < config.iterations:
             start = time.time()
+            tasks = next_tasks if next_tasks is not None else self.training_tasks()
+            next_tasks = (
+                self.training_tasks()
+                if config.prefetch_workers and self.iteration + 1 < config.iterations
+                else None
+            )
+            prefetch = list(next_tasks or ())
+            if config.prefetch_workers and first:
+                prefetch += self.eval_tasks()  # cached for every later eval
+            first = False
             trajectories = self.collector.collect(
-                self.model.state_dict(), self.training_tasks()
+                self.model.state_dict(), tasks, prefetch=prefetch
             )
             rollout_s = time.time() - start
             stats = ppo_update(

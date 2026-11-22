@@ -1,0 +1,157 @@
+# Long-run version of frontier_concurrency.yaml for the Chameleon node
+# (2x EPYC 7763: 128 cores, 250 GB; scripts/rl/run_chameleon_long.sh). Same
+# workloads, reward, model and teacher; changes:
+# - eval on 18 seeds (1000000-1000017), not 3 (6 until 2026-11-20 14:00)
+# - DAgger: 96 teacher seeds + 4 x 64 mixture seeds, 3 epochs per iteration
+# - PPO: 250 iterations of 6 seeds x 4 rollouts (as before) on 24 workers +
+#   3 prefetch workers (four runs fit side by side in RAM), eval every 10
+# - split_groups: a seed's 4 rollouts run on 4 workers instead of one after
+#   another on one
+# - reference_cache_dir + prefetch_workers: FCFS references are cached on disk
+#   (shared by all runs) and the next iteration's are run during the current
+#   rollouts, so an iteration waits on ~1 episode instead of FCFS + rollout
+# - share_predictors: workers fork from one process holding the ~6 GB of
+#   predictor forests (frontier/rl/preload.py), ~1.5 GB per worker instead of
+#   ~7.5, so several runs fit side by side
+# Episodes take ~130-230 s each on this CPU (~3-4x a laptop's).
+# Workloads, reward and teacher rationale: frontier_concurrency.yaml header.
+workloads:
+- name: synthetic_random
+  trace: synthetic:random
+  arrivals: sessions
+  num_requests: 200
+  num_blocks: 28318
+  weight: 1.0
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 18
+    session_warmup: 600
+    max_think_time: 600
+    load_range: [0.8, 1.25]
+  backend: frontier
+  frontier: &frontier
+    # A100 + Llama-3.1-8B as validated against vLLM (frontier/rl/engine.py
+    # a100_llama31_8b): piecewise CUDA graphs,
+    # 128k context, no CPU-overhead tables. Runs before 2026-11-19
+    # (rl_runs/frontier_concurrency{,_ppo}) had decode CUDA graphs off.
+    preset: a100_llama31_8b
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+eval_workloads:
+- name: tracelab_c8
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: &sim8
+    max_tokens: 131072
+    session_concurrency: 8
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier: *frontier
+- name: tracelab_c10
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: &sim10
+    max_tokens: 131072
+    session_concurrency: 10
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_c8
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: *sim8
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_c10
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: *sim10
+  backend: frontier
+  frontier: *frontier
+observation:
+  prefix_cache: true
+reward:
+  weights:
+    e2e_normalized: 1.0
+    ttft_hinge: 0.01
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  # one threshold per episode (FCFS's q95 TTFT)
+  reference_window_requests: 100000
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  init_middle_level_prob: 0.25
+imitation:
+  teacher: sjf_prefill_tokens_age200
+  iterations: 4
+  initial_seeds: 96
+  seeds_per_iteration: 64
+  beta_start: 0.5
+  beta_decay: 0.5
+  collect_decoding: argmax
+  epochs_per_iteration: 3
+  eval_every: 2
+  learning_rate: 0.0003
+  minibatch_size: 128
+  level_coef: 1.0
+  rank_coef: 1.0
+  max_dataset_size: 400000
+ppo:
+  imitation_coef: 0.1
+  learning_rate: 0.0001
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+num_priority_levels: 16
+iterations: 250
+seeds_per_iteration: 6
+group_size: 4
+num_workers: 24
+split_groups: true
+share_predictors: true
+reference_cache_dir: rl_runs/chameleon/references
+prefetch_workers: 3
+eval_every: 10
+eval_seeds: [1000000, 1000001, 1000002, 1000003, 1000004, 1000005, 1000006, 1000007, 1000008, 1000009, 1000010, 1000011, 1000012, 1000013, 1000014, 1000015, 1000016, 1000017]
+eval_decodings: [argmax]
+select_decoding: argmax
+keep_eval_checkpoints: true
+seed: 0
+output_dir: rl_runs/chameleon/imitation
+wandb: false
+wandb_project: vidur-rl

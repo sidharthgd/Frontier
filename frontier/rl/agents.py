@@ -74,6 +74,14 @@ class OracleSJFAgent(OracleAgent):
     requests eventually move ahead of new short ones (aging is in job-size units
     per second, e.g. tokens/s).
 
+    relative_aging > 0 divides each job size by 1 + (seconds waited) / relative_aging,
+    so a request's effective size halves after relative_aging seconds whatever its
+    size (absolute aging lets a short new request outrank a long one for size /
+    aging seconds, which is long for very long prompts).
+
+    cap > 0 puts every request that has waited at least cap seconds ahead of
+    the rest, in arrival order (FCFS for the overdue ones, SJF for the others).
+
     num_levels=None sorts the queue exactly (priority = rank). With
     num_levels=L the sorted queue is cut into L equal-size groups, which is a
     ranking the RL agent could itself express with L priority levels.
@@ -86,12 +94,18 @@ class OracleSJFAgent(OracleAgent):
         key: str = "total_tokens",
         num_levels: Optional[int] = None,
         aging: float = 0.0,
+        cap: Optional[float] = None,
+        relative_aging: Optional[float] = None,
     ):
         assert key in JOB_SIZE_KEYS, f"Unknown job size key {key}"
         assert aging >= 0
+        assert cap is None or cap > 0
+        assert relative_aging is None or relative_aging > 0
+        self._relative_aging = relative_aging
         self._key = key
         self._num_levels = num_levels
         self._aging = aging
+        self._cap = cap
         self.unbounded_priorities = num_levels is None
 
     def ranks(
@@ -109,10 +123,20 @@ class OracleSJFAgent(OracleAgent):
             ],
             dtype=float,
         )
-        sizes -= self._aging * (obs.time - obs.arrival_times)
+        waited = obs.time - obs.arrival_times
+        sizes -= self._aging * waited
+        if self._relative_aging is not None:
+            sizes /= 1.0 + waited / self._relative_aging
+        if self._cap is not None:
+            overdue = waited >= self._cap
+            # overdue requests first, by arrival; then the rest by size
+            sizes = np.where(overdue, obs.arrival_times, sizes)
+            group = np.where(overdue, 0, 1)
+        else:
+            group = np.zeros(len(sizes), dtype=int)
 
         # same order as the scheduler's (priority, arrival, id) sort
-        order = np.lexsort((obs.request_ids, obs.arrival_times, sizes))
+        order = np.lexsort((obs.request_ids, obs.arrival_times, sizes, group))
         ranks = np.empty(len(order), dtype=np.int64)
         ranks[order] = np.arange(len(order))
         return ranks
@@ -135,7 +159,9 @@ def bucket_ranks(ranks: np.ndarray, num_levels: int) -> np.ndarray:
 
 
 _SJF_NAME = re.compile(
-    r"^sjf_(?P<key>[a-z_]+?)(?:_age(?P<aging>[0-9.]+))?(?:_(?P<levels>[0-9]+)lvl)?$"
+    r"^sjf_(?P<key>[a-z_]+?)(?:_age(?P<aging>[0-9.]+))?(?:_rel(?P<rel>[0-9.]+))?"
+    r"(?:_cap(?P<cap>[0-9.]+))?"
+    r"(?:_(?P<levels>[0-9]+)lvl)?$"
 )
 
 
@@ -144,9 +170,11 @@ def baseline_agent(name: str, seed: Optional[int] = None) -> BaseAgent:
     A baseline by name:
       fcfs                             stock vLLM order
       random                           uniformly random priorities
-      sjf_<key>[_age<rate>][_<L>lvl]   OracleSJFAgent(key, num_levels=L, aging=rate),
-                                       e.g. sjf_decode_tokens, sjf_total_tokens_16lvl,
-                                       sjf_decode_tokens_age20
+      sjf_<key>[_age<rate>][_rel<s>][_cap<s>][_<L>lvl]
+                                       OracleSJFAgent(key, num_levels=L, aging=rate,
+                                       cap=s), e.g. sjf_decode_tokens,
+                                       sjf_total_tokens_16lvl, sjf_decode_tokens_age20,
+                                       sjf_prefill_tokens_cap20, sjf_prefill_tokens_rel30
     """
     if name == "fcfs":
         return FCFSAgent()
@@ -158,5 +186,7 @@ def baseline_agent(name: str, seed: Optional[int] = None) -> BaseAgent:
             match["key"],
             num_levels=int(match["levels"]) if match["levels"] else None,
             aging=float(match["aging"]) if match["aging"] else 0.0,
+            cap=float(match["cap"]) if match["cap"] else None,
+            relative_aging=float(match["rel"]) if match["rel"] else None,
         )
     raise ValueError(f"Unknown baseline {name}. {baseline_agent.__doc__}")

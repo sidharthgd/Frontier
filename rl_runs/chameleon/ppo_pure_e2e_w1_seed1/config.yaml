@@ -1,0 +1,179 @@
+workloads:
+- name: synthetic_random
+  trace: synthetic:random
+  arrivals: sessions
+  num_requests: 200
+  num_blocks: 28318
+  weight: 1.0
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 18
+    session_warmup: 600
+    max_think_time: 600
+    load_range:
+    - 0.8
+    - 1.25
+  backend: frontier
+  frontier:
+    preset: a100_llama31_8b
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+eval_workloads:
+- name: tracelab_c8
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 8
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier:
+    preset: a100_llama31_8b
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+- name: tracelab_c10
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 10
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier:
+    preset: a100_llama31_8b
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+- name: freeinference_c8
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 8
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier:
+    preset: a100_llama31_8b
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+- name: freeinference_c10
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 10
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier:
+    preset: a100_llama31_8b
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+observation:
+  prefix_cache: true
+reward:
+  weights:
+    e2e_normalized: 0.0
+    ttft_hinge: 1.0
+    e2e: 1.0
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  reference_window_requests: 100000
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  init_middle_level_prob: 0.25
+ppo:
+  imitation_coef: 0
+  learning_rate: 5.0e-05
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  target_kl: 0.02
+  device: auto
+  bucket_by_length: true
+imitation:
+  teacher: sjf_prefill_tokens_age200
+  iterations: 4
+  initial_seeds: 96
+  seeds_per_iteration: 64
+  beta_start: 0.5
+  beta_decay: 0.5
+  collect_decoding: argmax
+  epochs_per_iteration: 3
+  eval_every: 2
+  learning_rate: 0.0003
+  minibatch_size: 128
+  level_coef: 1.0
+  rank_coef: 1.0
+  max_dataset_size: 400000
+init_checkpoint: null
+resume_checkpoint: null
+num_priority_levels: 16
+iterations: 250
+seeds_per_iteration: 6
+group_size: 8
+num_workers: 48
+split_groups: true
+share_predictors: true
+reference_cache_dir: rl_runs/chameleon/references
+prefetch_workers: 3
+eval_every: 10
+eval_decodings:
+- argmax
+select_decoding: argmax
+keep_eval_checkpoints: true
+eval_seeds:
+- 1000000
+- 1000001
+- 1000002
+- 1000003
+- 1000004
+- 1000005
+- 1000006
+- 1000007
+- 1000008
+- 1000009
+- 1000010
+- 1000011
+- 1000012
+- 1000013
+- 1000014
+- 1000015
+- 1000016
+- 1000017
+seed: 1
+output_dir: rl_runs/chameleon/ppo_pure_e2e_w1_seed1
+wandb: false
+wandb_project: vidur-rl

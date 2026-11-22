@@ -1,0 +1,64 @@
+checkpoint: rl_runs/chameleon/ppo_pure_e2e_sq0.02/cdfs_checkpoint.pt
+config: configs/rl/frontier_concurrency_long.yaml
+seeds:
+- 1000000
+- 1000001
+- 1000002
+- 1000003
+- 1000004
+- 1000005
+backend: frontier
+policies:
+- fcfs
+- sjf_prefill_tokens_age200
+- sjf_prefill_tokens_rel30
+- sjf_prefill_tokens
+- policy_argmax
+workloads:
+- name: tracelab_c8
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: &id002
+    max_tokens: 131072
+    session_concurrency: 8
+    max_think_time: 600
+    session_warmup: 600
+  backend: frontier
+  frontier: &id001
+    preset: a100_llama31_8b
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+- name: tracelab_c10
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: &id003
+    max_tokens: 131072
+    session_concurrency: 10
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier: *id001
+- name: freeinference_c8
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: *id002
+  backend: frontier
+  frontier: *id001
+- name: freeinference_c10
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: *id003
+  backend: frontier
+  frontier: *id001

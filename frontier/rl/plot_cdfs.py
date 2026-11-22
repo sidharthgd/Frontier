@@ -30,7 +30,6 @@ LABELS/STYLES are labelled by name with a fallback color.
 """
 
 import argparse
-import multiprocessing as mp
 import os
 from typing import Dict, List, Sequence
 
@@ -42,6 +41,7 @@ import numpy as np
 import yaml
 
 from frontier.rl.agents import baseline_agent
+from frontier.rl.preload import pool_context
 from frontier.rl.reward import RewardConfig, episode_metric_samples
 from frontier.rl.rollout import WorkloadConfig
 from frontier.rl.torch_agent import TorchAgent
@@ -71,6 +71,7 @@ LABELS = {
     "policy_argmax": "RL policy (argmax)",
     "sjf_prefill_tokens": "SJF (uncached prompt)",
     "sjf_prefill_tokens_age200": "Uncached SJF + aging 200 tok/s",
+    "sjf_prefill_tokens_rel30": "Uncached SJF + relative aging 30 s",
 }
 # validated categorical slots 1-5, plus line style so identity isn't color alone
 STYLES = {
@@ -82,6 +83,7 @@ STYLES = {
     "policy_argmax": ("#eda100", ":"),
     "sjf_prefill_tokens": ("#eb6834", "--"),
     "sjf_prefill_tokens_age200": ("#1baf7a", "-."),
+    "sjf_prefill_tokens_rel30": ("#8a5cd6", (0, (5, 1, 1, 1))),
 }
 # for policies not listed above
 FALLBACK_STYLES = [
@@ -263,7 +265,12 @@ def main() -> None:
         (w, args.checkpoint, args.config, args.seeds, data_dir, args.backend, (p,))
         for w in WORKLOADS for p in policies
     ]
-    with mp.get_context("spawn").Pool(args.workers) as pool:
+    # workers fork from one process holding the predictors (frontier/rl/preload.py)
+    context = pool_context(
+        [WorkloadConfig(**dict(w, backend="frontier")) for w in WORKLOADS],
+        os.path.join(args.output_dir, "preload"),
+    )
+    with context.Pool(args.workers) as pool:
         for name in pool.imap_unordered(run_workload, tasks):
             print(f"done: {name}", flush=True)
     plot_all(args.output_dir, data_dir, args.seeds, args.backend, comparisons)

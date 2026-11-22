@@ -646,6 +646,23 @@ class FrontierEnv(SchedulingEnv):
             os.replace(temporary, path)
         return path
 
+    def build_predictors(self) -> None:
+        """Build the execution-time predictors this env's episodes use (once
+        per process and engine setting; see frontier/rl/preload.py)."""
+        trace = self.workload_trace(0)
+        spec = WorkloadSpec(
+            name="vidur_workload",
+            num_requests=len(pd.read_csv(trace, usecols=["arrived_at"])),
+            arrivals="replay",
+            replay_trace=trace,
+            max_tokens=self._config.request_generator_config.max_tokens,
+            **self._spec_kwargs,
+        )
+        with _working_dir(FRONTIER_ROOT):
+            config = frontier_config(spec, 0, self._output_dir, "error")
+            with _feature_scheduler_installed(), _shared_predictors(_engine_key(spec)):
+                _RLSimulator(config)
+
     def run_episode(
         self,
         agent: BaseAgent,

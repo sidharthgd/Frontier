@@ -9,6 +9,8 @@ own simulator backend stayed behind.
 """
 
 import dataclasses
+import os
+import pickle
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -172,6 +174,26 @@ def _summarize(episode: Episode, end_time: float) -> Dict[str, float]:
 
 
 
+# reference episodes kept in memory per env when they are also on disk
+REFERENCES_IN_MEMORY = 8
+
+
+def _store_reference(episode: Episode, path: str) -> Episode:
+    """A reference episode, without its observations (no consumer of a
+    reference run reads them), atomically, so concurrent writers and readers
+    of the same file are safe."""
+    slim = dataclasses.replace(
+        episode,
+        transitions=[dataclasses.replace(t, obs=None) for t in episode.transitions],
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = f"{path}.{os.getpid()}.tmp"
+    with open(temporary, "wb") as f:
+        pickle.dump(slim, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(temporary, path)
+    return slim
+
+
 class SchedulingEnv:
     """
     Reference runs, reward context and threshold calibration for an
@@ -182,7 +204,14 @@ class SchedulingEnv:
     The workload (arrival times, request lengths) is fully determined by
     workload_seed, so several rollouts on the same seed differ only through the
     agent's own sampling.
+
+    reference_cache_dir: also keep reference episodes there, as
+    <baseline>__<seed>.pkl without observations, so other workers and runs
+    on the same workload reuse them (frontier/rl/rollout.py sets it per
+    workload settings).
     """
+
+    reference_cache_dir: Optional[str] = None
 
     @property
     def config(self) -> SimulationConfig:
@@ -209,13 +238,31 @@ class SchedulingEnv:
         """
         key = (baseline, workload_seed, repr(request_generator_config))
         if key not in self._reference_episodes:
-            # a plain reward config, so building it needs no reference runs
-            self._reference_episodes[key] = self.run_episode(
-                baseline_agent(baseline, seed=workload_seed),
-                workload_seed,
-                request_generator_config,
-                reward_config=RewardConfig(),
-            )
+            path = None
+            if self.reference_cache_dir and request_generator_config is None:
+                path = os.path.join(
+                    self.reference_cache_dir, f"{baseline}__{workload_seed}.pkl"
+                )
+            if path and os.path.exists(path):
+                with open(path, "rb") as f:
+                    self._reference_episodes[key] = pickle.load(f)
+            else:
+                # a plain reward config, so building it needs no reference runs
+                episode = self.run_episode(
+                    baseline_agent(baseline, seed=workload_seed),
+                    workload_seed,
+                    request_generator_config,
+                    reward_config=RewardConfig(),
+                )
+                # with a disk copy, memory holds the same slim episode
+                self._reference_episodes[key] = (
+                    _store_reference(episode, path) if path else episode
+                )
+            if self.reference_cache_dir:
+                # the disk has them all: keep only the most recent in memory,
+                # else a long run's workers grow by an episode per iteration
+                while len(self._reference_episodes) > REFERENCES_IN_MEMORY:
+                    del self._reference_episodes[next(iter(self._reference_episodes))]
         return self._reference_episodes[key]
 
     def reward_context(

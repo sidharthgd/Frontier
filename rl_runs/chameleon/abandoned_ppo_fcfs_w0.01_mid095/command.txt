@@ -1,0 +1,1 @@
+.venv/bin/python -m frontier.rl.train --config configs/rl/frontier_concurrency_long.yaml --set output_dir=rl_runs/chameleon/ppo_fcfs_w0.01 --set reward.weights.ttft_hinge=0.01 --set ppo.imitation_coef=0 --set model.init_middle_level_prob=0.95  > rl_runs/chameleon/ppo_fcfs_w0.01/train.log 2>&1

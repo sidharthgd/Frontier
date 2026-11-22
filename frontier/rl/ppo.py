@@ -186,9 +186,13 @@ def group_advantages(
     """
     advantages = []
     for i, (times, _, _, returns) in enumerate(group):
-        others = [g for j, g in enumerate(group) if j != i]
+        # a rollout with no decisions (e.g. a draw light enough that nothing
+        # ever waited) has no return to read: leave it out of the baseline
+        others = [g for j, g in enumerate(group) if j != i and len(g[0])]
         baseline = np.array(
             [np.mean([return_at(*other, t) for other in others]) for t in times]
+            if others
+            else np.zeros(len(times))
         )
         advantages.append(returns - baseline)
     return advantages

@@ -8,6 +8,7 @@ numpy data plus the transitions, so they cross process boundaries cheaply.
 """
 
 import dataclasses
+import hashlib
 import multiprocessing as mp
 import os
 from dataclasses import dataclass, field
@@ -129,11 +130,13 @@ class RolloutRunner:
         observation_config: ObservationConfig,
         model_config: ModelConfig,
         output_dir: str,
+        reference_cache_dir: Optional[str] = None,
     ) -> None:
         self._workloads = {w.name: w for w in workloads}
         self._reward_config = reward_config
         self._observation_config = observation_config
         self._output_dir = output_dir
+        self._reference_cache_dir = reference_cache_dir
         self._envs: Dict[str, FrontierEnv] = {}
         self.model = SchedulerModel(model_config)
         self.model.eval()
@@ -146,6 +149,12 @@ class RolloutRunner:
                 self.model.config.num_priority_levels,
                 self._output_dir,
             )
+            if self._reference_cache_dir:
+                self._envs[workload].reference_cache_dir = reference_dir(
+                    self._reference_cache_dir,
+                    self._workloads[workload],
+                    self.model.config.num_priority_levels,
+                )
         return self._envs[workload]
 
     def run(self, task: RolloutTask) -> Trajectory:
@@ -185,6 +194,23 @@ class RolloutRunner:
         return [self.run(task) for task in tasks]
 
 
+def reference_dir(root: str, workload: WorkloadConfig, num_priority_levels: int) -> str:
+    """Where a workload's reference episodes are cached: one directory per
+    workload settings (everything a baseline episode depends on), so runs
+    with the same workloads share it and changed settings never collide."""
+    settings = dataclasses.asdict(workload)
+    settings.pop("weight")  # sampling weight only
+    digest = hashlib.sha1(
+        repr((sorted(settings.items()), num_priority_levels)).encode()
+    ).hexdigest()[:10]
+    return os.path.join(root, f"{workload.name}_{digest}")
+
+
+def prefetch_references(runner: RolloutRunner, workload: str, seed: int) -> None:
+    """Run (or load) the FCFS reference of one (workload, seed) into the cache."""
+    runner.env(workload).reference_episode("fcfs", seed)
+
+
 # --- multiprocessing ---------------------------------------------------------
 
 _WORKER: Optional[RolloutRunner] = None
@@ -201,6 +227,10 @@ def _run_chunk(payload: Tuple[Dict[str, torch.Tensor], List[RolloutTask]]):
     return _WORKER.run_all(state_dict, tasks)
 
 
+def _prefetch(key: Tuple[str, int]) -> None:
+    prefetch_references(_WORKER, *key)
+
+
 class RolloutCollector:
     """Runs tasks in-process (num_workers=0) or on a pool of spawned workers."""
 
@@ -212,33 +242,78 @@ class RolloutCollector:
         model_config: ModelConfig,
         output_dir: str,
         num_workers: int = 0,
+        split_groups: bool = False,
+        share_predictors: bool = False,
+        reference_cache_dir: Optional[str] = None,
+        prefetch_workers: int = 0,
     ) -> None:
-        args = (workloads, reward_config, observation_config, model_config, output_dir)
+        assert not prefetch_workers or reference_cache_dir, (
+            "prefetching needs reference_cache_dir (workers share references through it)"
+        )
+        args = (
+            workloads, reward_config, observation_config, model_config, output_dir,
+            reference_cache_dir,
+        )
         self._num_workers = num_workers
+        self._split_groups = split_groups
+        self._prefetches: List = []
         if num_workers > 0:
-            # spawn: torch and fork do not mix; workers build their envs once
-            context = mp.get_context("spawn")
-            self._pool = context.Pool(num_workers, _init_worker, (args,))
+            # spawn: torch and fork do not mix; workers build their envs once.
+            # share_predictors: fork from a server holding the predictors
+            # (frontier/rl/preload.py), to fit more workers in RAM
+            if share_predictors:
+                from frontier.rl.preload import pool_context
+
+                context = pool_context(workloads, os.path.join(output_dir, "preload"))
+            else:
+                context = mp.get_context("spawn")
+            # prefetch_workers extra workers run the next iteration's FCFS
+            # references while the rollouts (num_workers chunks) run
+            self._pool = context.Pool(
+                num_workers + prefetch_workers, _init_worker, (args,)
+            )
             self._runner = None
         else:
             self._pool = None
             self._runner = RolloutRunner(*args)
 
     def collect(
-        self, state_dict: Dict[str, torch.Tensor], tasks: Sequence[RolloutTask]
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        tasks: Sequence[RolloutTask],
+        prefetch: Sequence[RolloutTask] = (),
     ) -> List[Trajectory]:
+        """Run tasks; with workers, also start the FCFS references of the
+        `prefetch` tasks (the next call's) into reference_cache_dir, queued
+        behind these tasks so they only take the spare workers."""
         state_dict = {k: v.detach().cpu() for k, v in state_dict.items()}
         if self._pool is None:
             return self._runner.run_all(state_dict, tasks)
         # keep each (workload, seed) group on one worker, so its reference runs
-        # (FCFS, thresholds) are computed once
-        groups: Dict[Tuple[str, int], List[RolloutTask]] = {}
-        for task in tasks:
-            groups.setdefault((task.workload, task.workload_seed), []).append(task)
+        # (FCFS, thresholds) are computed once; split_groups spreads a group's
+        # tasks over workers instead, each recomputing the references (same
+        # results, more CPU, about 2 episodes of wall time instead of
+        # group_size + 1 when there are enough workers)
+        groups: Dict[Tuple, List[RolloutTask]] = {}
+        for i, task in enumerate(tasks):
+            key = (task.workload, task.workload_seed)
+            groups.setdefault(key + ((i,) if self._split_groups else ()), []).append(task)
         chunks = [[] for _ in range(self._num_workers)]
         for i, group in enumerate(groups.values()):
             chunks[i % self._num_workers].extend(group)
-        results = self._pool.map(_run_chunk, [(state_dict, c) for c in chunks if c])
+        pending = self._pool.map_async(
+            _run_chunk, [(state_dict, c) for c in chunks if c], chunksize=1
+        )
+        for done in [p for p in self._prefetches if p.ready()]:
+            if not done.successful():
+                try:
+                    done.get()
+                except Exception as error:  # the rollout recomputes it
+                    print(f"reference prefetch failed: {error!r}", flush=True)
+        self._prefetches = [p for p in self._prefetches if not p.ready()]
+        for key in dict.fromkeys((t.workload, t.workload_seed) for t in prefetch):
+            self._prefetches.append(self._pool.apply_async(_prefetch, (key,)))
+        results = pending.get()
         trajectories = [t for chunk in results for t in chunk]
         order = {dataclasses.astuple(t): i for i, t in enumerate(tasks)}
         return sorted(trajectories, key=lambda t: order[dataclasses.astuple(t.task)])
