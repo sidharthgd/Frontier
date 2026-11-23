@@ -1,0 +1,115 @@
+==== 1. scheduler calls by category (base policy, scored window, all seeds pooled)
+blocked: no token budget / batch at max_num_seqs; nofit: no waiting request's first chunk fits the free KV;
+single: 1 waiting (fits); allfit: all waiting fit in any order;
+decide: order can change the batch. 'policy calls/s' = decide calls per simulated second.
+workload    calls  blocked    nofit   single   allfit   decide  decide/s  mean n|decide | ex post at decide: none / some / all admitted
+TL c10     417522    13.3%    21.1%     2.7%     0.0%    62.9%      2.52            2.8 |  98.6% /   1.3% /   0.0%
+   decide calls admitting nothing: 258914; policy's first request did not fit in 100.0% of them, though SJF's first would have fit in 33.2% (all decide calls: policy first fits 1.4%, SJF first fits 34.2%)
+FI c10     393477    15.0%    20.4%     3.2%     0.0%    61.4%      2.31            3.1 |  98.7% /   1.3% /   0.1%
+   decide calls admitting nothing: 238450; policy's first request did not fit in 100.0% of them, though SJF's first would have fit in 26.2% (all decide calls: policy first fits 1.3%, SJF first fits 27.2%)
+TL c8      114320    13.2%    36.6%    11.3%     0.0%    38.8%      0.50            2.3 |  98.8% /   1.0% /   0.2%
+   decide calls admitting nothing: 43880; policy's first request did not fit in 100.0% of them, though SJF's first would have fit in 32.2% (all decide calls: policy first fits 1.2%, SJF first fits 33.0%)
+FI c8      146918    12.7%    35.8%     9.4%     0.0%    42.1%      0.65            2.5 |  98.9% /   0.9% /   0.1%
+   decide calls admitting nothing: 61155; policy's first request did not fit in 100.0% of them, though SJF's first would have fit in 26.3% (all decide calls: policy first fits 1.1%, SJF first fits 27.1%)
+
+==== 2. policy cost per call (wall time on the Chameleon node's CPU, one thread)
+t_cache: prefix-cache lookups (vLLM does these at admission anyway); t_obs: feature building; t_model: transformer forward. ms.
+TL c10   per call: cache 0.05  check 0.03  obs 0.32  model 0.97 (obs+model p99 1.58) | median sim gap between calls 50.8 ms
+         policy ms per simulated second: every call 5.2, skipping blocked+nofit 3.4 (34% saved), decide only 3.3 (37% saved)
+FI c10   per call: cache 0.05  check 0.03  obs 0.33  model 0.97 (obs+model p99 1.62) | median sim gap between calls 46.8 ms
+         policy ms per simulated second: every call 4.9, skipping blocked+nofit 3.2 (35% saved), decide only 3.0 (38% saved)
+TL c8    per call: cache 0.04  check 0.03  obs 0.32  model 0.99 (obs+model p99 1.85) | median sim gap between calls 50.8 ms
+         policy ms per simulated second: every call 1.7, skipping blocked+nofit 0.9 (48% saved), decide only 0.6 (62% saved)
+FI c8    per call: cache 0.04  check 0.03  obs 0.32  model 0.98 (obs+model p99 1.82) | median sim gap between calls 46.3 ms
+         policy ms per simulated second: every call 2.0, skipping blocked+nofit 1.1 (47% saved), decide only 0.8 (58% saved)
+
+==== 3. skipping non-decide calls: e2e / TTFT vs base (pooled quantiles; % change, paired seeds)
+TL c10   skip_exact (18 seeds, mean e2e +0.0%, 100% of calls identical e2e) e2e: +0.0%/+0.0%/+0.0%/+0.0%  TTFT: +0.0%/+0.0%/+0.0%/+0.0%
+         skip_mid (18 seeds, mean e2e +1.1%, 18% of calls identical e2e) e2e: -0.1%/-1.1%/+1.3%/-9.8%  TTFT: +14.2%/+0.8%/+14.4%/+62.5%
+         skip_sjf (18 seeds, mean e2e +3.0%, 18% of calls identical e2e) e2e: +0.4%/+3.0%/+4.9%/-6.7%  TTFT: +10.3%/+2.1%/+5.9%/+63.3%
+FI c10   skip_exact (18 seeds, mean e2e +0.0%, 100% of calls identical e2e) e2e: +0.0%/+0.0%/+0.0%/+0.0%  TTFT: +0.0%/+0.0%/+0.0%/+0.0%
+         skip_mid (18 seeds, mean e2e -0.1%, 17% of calls identical e2e) e2e: -1.2%/+3.9%/+0.7%/-2.2%  TTFT: +1.2%/+3.1%/+4.8%/-13.6%
+         skip_sjf (18 seeds, mean e2e +0.7%, 14% of calls identical e2e) e2e: -1.7%/+2.3%/+7.3%/+6.2%  TTFT: -3.6%/-0.8%/+6.1%/+54.5%
+TL c8    skip_exact (18 seeds, mean e2e +0.0%, 100% of calls identical e2e) e2e: +0.0%/+0.0%/+0.0%/+0.0%  TTFT: +0.0%/+0.0%/+0.0%/+0.0%
+         skip_mid (18 seeds, mean e2e -0.1%, 55% of calls identical e2e) e2e: +0.0%/-0.2%/-0.3%/+4.3%  TTFT: -1.4%/-1.6%/+7.7%/+1.2%
+         skip_sjf (18 seeds, mean e2e -0.7%, 47% of calls identical e2e) e2e: -1.4%/-0.8%/-4.8%/-2.8%  TTFT: -1.9%/-0.6%/-1.2%/-6.1%
+FI c8    skip_exact (18 seeds, mean e2e -0.0%, 100% of calls identical e2e) e2e: +0.0%/+0.0%/+0.0%/+0.0%  TTFT: +0.0%/+0.0%/+0.0%/+0.0%
+         skip_mid (18 seeds, mean e2e +0.2%, 38% of calls identical e2e) e2e: -0.1%/+1.6%/-4.7%/+3.4%  TTFT: +2.7%/+1.6%/+5.1%/+21.3%
+         skip_sjf (18 seeds, mean e2e -0.4%, 23% of calls identical e2e) e2e: -0.4%/-0.5%/-6.1%/+9.0%  TTFT: +2.4%/-0.5%/+0.7%/+15.1%
+(quantiles p50/p95/p99/p100)
+
+==== 4. policy vs plain SJF (uncached-prefill order) at decide calls
+partial = admitted some but not all. same set: the k admitted are the k smallest uncached prefills;
+top-1: its first-ranked request is a smallest-uncached one; tau: Kendall tau-b of level vs uncached size
+TL c10   decide calls  262557 (mean queue 2.8): top-1 is smallest uncached  66.7%, tau median +1.00 mean +0.61 | partial 3523: same set as SJF  63.5%, top-1  64.2%
+FI c10   decide calls  241708 (mean queue 3.1): top-1 is smallest uncached  73.7%, tau median +0.91 mean +0.66 | partial 3132: same set as SJF  69.6%, top-1  71.1%
+TL c8    decide calls   44403 (mean queue 2.3): top-1 is smallest uncached  67.8%, tau median +1.00 mean +0.43 | partial 452: same set as SJF  64.2%, top-1  64.4%
+FI c8    decide calls   61814 (mean queue 2.5): top-1 is smallest uncached  73.7%, tau median +1.00 mean +0.61 | partial 580: same set as SJF  71.2%, top-1  71.7%
+
+==== 5. where the policy departs from SJF at partial calls: pairs (A admitted, O left waiting, A's uncached > O's)
+share of pairs where A ... (the policy sees waited, cached tokens, idle blocks, eviction distance, restarts; it does not see output length)
+TL c10   pairs   1483, uncached A/O median 35432/17026 (ratio 1.8x), A waited +8.2s more (median) | waited longer 66%  more cached tokens 71%  higher hit fraction 56%  idle cached prefix 68%  nearer eviction 61%  is a restart 28%  (O restart) 6%  (O fit on its own) 95%  shorter output 45%
+FI c10   pairs   1224, uncached A/O median 45438/27185 (ratio 1.5x), A waited +0.4s more (median) | waited longer 51%  more cached tokens 82%  higher hit fraction 80%  idle cached prefix 73%  nearer eviction 69%  is a restart 18%  (O restart) 3%  (O fit on its own) 100%  shorter output 55%
+TL c8    pairs    170, uncached A/O median 35050/18394 (ratio 1.8x), A waited +0.9s more (median) | waited longer 55%  more cached tokens 81%  higher hit fraction 66%  idle cached prefix 84%  nearer eviction 74%  is a restart 23%  (O restart) 1%  (O fit on its own) 98%  shorter output 40%
+FI c8    pairs    184, uncached A/O median 43608/26278 (ratio 1.4x), A waited -0.7s more (median) | waited longer 50%  more cached tokens 84%  higher hit fraction 80%  idle cached prefix 80%  nearer eviction 70%  is a restart 18%  (O restart) 1%  (O fit on its own) 99%  shorter output 45%
+
+==== 6. what predicts the policy's order: logistic regression on 'i ranked ahead of j' over request pairs
+with different levels at decide calls (pair orientation randomized, no intercept; 5-fold CV accuracy).
+standardized coefficients: positive = a larger value moves the request ahead
+TL c10   pairs 300000 | rule agreement: SJF 85.2%, FCFS 37.9% | logistic: uncached 85.2%, +waited 85.2%, +cache state 98.1%, +fits, restarts (all) 99.4%
+         coefs: log uncached -9.22, log cached +2.22, log waited -0.22, restarts -0.06, idle prefix -0.31, log evict dist -1.46, fits now -27.05
+FI c10   pairs 300000 | rule agreement: SJF 87.9%, FCFS 36.3% | logistic: uncached 87.9%, +waited 88.7%, +cache state 96.0%, +fits, restarts (all) 98.2%
+         coefs: log uncached -7.86, log cached +0.55, log waited +0.25, restarts +0.02, idle prefix -0.73, log evict dist -1.24, fits now -9.86
+TL c8    pairs 66296 | rule agreement: SJF 74.3%, FCFS 49.9% | logistic: uncached 74.3%, +waited 78.0%, +cache state 99.0%, +fits, restarts (all) 99.6%
+         coefs: log uncached -9.81, log cached +19.43, log waited +2.54, restarts +1.03, idle prefix +7.48, log evict dist -6.52, fits now -10.75
+FI c8    pairs 109570 | rule agreement: SJF 83.7%, FCFS 33.5% | logistic: uncached 83.7%, +waited 85.6%, +cache state 96.9%, +fits, restarts (all) 97.6%
+         coefs: log uncached -7.86, log cached +3.91, log waited +0.92, restarts +0.63, idle prefix +1.53, log evict dist +0.70, fits now -10.73
+
+==== 7. mean level (0-15, lower runs first) by uncached-prefill size and wait, decide calls
+TL c10 (columns: time waited)
+wb                    n  <1s  1-10s  10-60s  60-300s  >300s
+uncached tokens                                            
+0                     0  NaN    NaN     NaN      NaN    NaN
+1-256              1895  7.0    6.9     5.8      4.8    4.9
+257-1k             3865  7.7    6.5     5.3      5.3    5.1
+1k-4k             25114  7.2    6.7     6.6      5.6    5.0
+4k-16k           136192  7.7    6.5     6.6      6.1    5.5
+16k-64k          432780  8.8    7.3     7.6      8.0    6.6
+>64k             137638  9.7    9.5     9.1      9.7    9.8
+FI c10 (columns: time waited)
+wb                    n  <1s  1-10s  10-60s  60-300s  >300s
+uncached tokens                                            
+0                     0  NaN    NaN     NaN      NaN    NaN
+1-256              1418  6.4    6.3     4.7      4.2    4.1
+257-1k             3005  7.1    5.9     4.5      4.2    4.4
+1k-4k             16219  6.2    5.2     4.9      4.7    4.2
+4k-16k            87426  6.5    5.3     5.5      4.9    4.7
+16k-64k          447770  8.8    6.7     7.6      8.0    7.5
+>64k             189440  9.8    9.3     8.9      8.8    8.7
+TL c8 (columns: time waited)
+wb                   n  <1s  1-10s  10-60s  60-300s  >300s
+uncached tokens                                           
+0                    0  NaN    NaN     NaN      NaN    NaN
+1-256              497  7.4    7.3     5.5      5.0    NaN
+257-1k            1143  7.8    7.1     5.2      5.3    NaN
+1k-4k             3875  7.2    7.4     6.5      5.3    NaN
+4k-16k           23623  8.2    7.0     7.0      5.3    4.6
+16k-64k          65372  9.0    7.5     7.7      8.5    8.1
+>64k              7447  9.3    9.2     8.7      8.8    NaN
+FI c8 (columns: time waited)
+wb                    n   <1s  1-10s  10-60s  60-300s  >300s
+uncached tokens                                             
+0                     0   NaN    NaN     NaN      NaN    NaN
+1-256               306   6.6    6.5     4.8      4.0    NaN
+257-1k              408   7.0    6.9     4.2      4.0    NaN
+1k-4k              3272   7.6    5.5     4.4      4.4    NaN
+4k-16k            15793   6.2    5.3     5.1      4.4    5.0
+16k-64k          101136   9.3    6.9     7.3      8.3    5.7
+>64k              31822  10.0    9.0     9.3      9.4    9.0
+
+==== 8. PPO's first-ranked request at decide calls vs the first request of two rules
+rule SJF: smallest uncached prefill; rule CP-SJF: most idle cached blocks if any request has some, else SJF
+tracelab_c10       calls  262557 | PPO head = SJF head  66.7% | = CP-SJF head  99.7% (with an idle prefix waiting: 100% of calls, agreement there 99.8%; without: 59.8%)
+freeinference_c10  calls  241708 | PPO head = SJF head  73.7% | = CP-SJF head  99.8% (with an idle prefix waiting: 100% of calls, agreement there 99.8%; without: 68.5%)
+tracelab_c8        calls   44403 | PPO head = SJF head  67.8% | = CP-SJF head  99.8% (with an idle prefix waiting: 100% of calls, agreement there 99.9%; without: 57.5%)
+freeinference_c8   calls   61814 | PPO head = SJF head  73.7% | = CP-SJF head  99.9% (with an idle prefix waiting: 100% of calls, agreement there 99.9%; without: 70.2%)

@@ -43,11 +43,70 @@ def _init(config_path, output_dir):
     )
 
 
+def _watermark_sjf(watermark):
+    """Plain (uncached-prefill) SJF that holds admission when admitting its
+    first request would leave less than `watermark` of the KV pool free: it
+    then puts the waiting request needing the most blocks first, which does
+    not fit, so admission stops (scripts/rl/decision_anatomy.py found the
+    pure-PPO policy doing this). A test of that mechanism, not a tuned policy."""
+    from math import ceil
+
+    from frontier.rl.agents import OracleAgent, OracleSJFAgent
+
+    class WatermarkSJF(OracleAgent):
+        unbounded_priorities = True
+
+        def __init__(self):
+            self._sjf = OracleSJFAgent("prefill_tokens")
+
+        def act_oracle(self, obs, waiting, scheduler):
+            ranks = np.asarray(self._sjf.act_oracle(obs, waiting, scheduler)[0]) + 1
+            pool = scheduler._scheduler._kv_cache_manager.block_pool
+            bs = scheduler.block_size
+            need = np.array([ceil(r.num_prefill_tokens / bs) - r.num_cached_prefill_tokens // bs
+                             for r in waiting])
+            first = int(np.argmin(ranks))
+            if len(waiting) > 1 and pool.get_num_free_blocks() - need[first] < watermark * scheduler.num_blocks:
+                ranks[int(np.argmax(need))] = 0
+            return ranks, {}
+
+    return WatermarkSJF()
+
+
+def _cache_protecting_sjf():
+    """Plain SJF, except the waiting request with the most idle cached prefix
+    blocks (cached KV no running request holds, which the next allocations
+    evict) goes first. If it does not fit, admission stops, so no other request
+    is admitted at the cost of its prefix; scripts/rl/decision_anatomy.py found
+    the pure-PPO policy's queue head is this request whenever it holds."""
+    from frontier.rl.agents import OracleAgent, OracleSJFAgent
+    from frontier.rl.prefix_cache import prefix_cache_view
+
+    class CacheProtectingSJF(OracleAgent):
+        unbounded_priorities = True
+
+        def __init__(self):
+            self._sjf = OracleSJFAgent("prefill_tokens")
+
+        def act_oracle(self, obs, waiting, scheduler):
+            ranks = np.asarray(self._sjf.act_oracle(obs, waiting, scheduler)[0]) + 1
+            idle = np.array([prefix_cache_view(scheduler._scheduler, r._request)[1] for r in waiting])
+            if idle.max() > 0:
+                ranks[int(np.argmax(idle))] = 0
+            return ranks, {}
+
+    return CacheProtectingSJF()
+
+
 def _agent(name, seed):
     from frontier.rl.agents import baseline_agent
     from frontier.rl.torch_agent import TorchAgent
     from frontier.rl.train import load_checkpoint
 
+    if name == "cpsjf":
+        return _cache_protecting_sjf()
+    if name.startswith("wmsjf"):
+        return _watermark_sjf(float(name[len("wmsjf"):]))
     if not name.startswith("ckpt:"):
         return baseline_agent(name, seed=seed)
     path = name[len("ckpt:"):]
