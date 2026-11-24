@@ -5,7 +5,9 @@
 # re-converted yet (its raw trace is not on this machine), so only TraceLab is
 # evaluated. Loads from the FCFS capacity sweep (rl_runs/h200/capacity): TraceLab
 # c12 light (1.3% of calls preempted), c16 pressured (12%), c20 heavy (30%); training
-# on synthetic sessions at 30 agents (14%) with a 0.8-1.25 load multiplier.
+# on synthetic sessions (1M compaction) at 18 agents with a 0.8-1.25 load multiplier:
+# FCFS preempts 18% of calls on average (rl_runs/h200/capacity_synth1m), set mostly
+# by each seed's sampled session sizes (some seeds none, some 40-50%).
 workloads:
 - name: synthetic_random
   trace: synthetic:random
@@ -16,7 +18,7 @@ workloads:
   gap_metric: false
   simulation:
     max_tokens: 890000
-    session_concurrency: 30
+    session_concurrency: 18
     session_warmup: 600
     max_think_time: 600
     load_range:
