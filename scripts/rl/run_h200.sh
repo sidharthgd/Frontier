@@ -17,7 +17,7 @@ ppo() {  # <name> <w> [extra --set ...]: Cyrus's pure-PPO recipe (A100 headline 
     local name=$1 w=$2; shift 2
     local out=$ROOT/$name
     mkdir -p $out
-    local cmd="$PY -m frontier.rl.train --config $CONFIG --set output_dir=$out --set reward.weights.ttft_hinge=$w --set ppo.imitation_coef=0 --set reward.weights.e2e=1.0 --set reward.weights.e2e_normalized=0.0 --set group_size=8 --set num_workers=44 --set ppo.learning_rate=0.00005 --set ppo.target_kl=0.02 --set iterations=40 --set "eval_seeds=[1000000,1000001,1000002,1000003,1000004,1000005]" $* > $out/train.log 2>&1"
+    local cmd="$PY -m frontier.rl.train --config $CONFIG --set output_dir=$out --set reward.weights.ttft_hinge=$w --set ppo.imitation_coef=0 --set reward.weights.e2e=1.0 --set reward.weights.e2e_normalized=0.0 --set group_size=8 --set num_workers=44 --set ppo.learning_rate=0.00005 --set ppo.target_kl=0.02 --set iterations=100 --set "eval_seeds=[1000000,1000001,1000002,1000003,1000004,1000005]" $* > $out/train.log 2>&1"
     echo "$cmd" > $out/command.txt
     tmux new -d -s "$name" -c "$PWD" "$ENV; $cmd"
     echo "started $name"
