@@ -5,7 +5,8 @@ RL hook (frontier/rl/scheduler.py) orders admission. frontier_env.FrontierEnv
 builds a WorkloadSpec per episode and runs it.
 
 - WorkloadSpec: the replayed trace and the hardware/engine settings;
-  a100_llama31_8b / PRESETS name the vLLM-validated A100 setup.
+  a100_llama31_8b / PRESETS name the vLLM-validated A100 setup (and the
+  H200 1M-context one, h200_nemotron_1m).
 - make_simulation_config: a Frontier SimulationConfig, through Frontier's CLI.
 - _shared_predictors: one execution-time predictor per engine setting per
   process (building one takes ~1 min), optionally with rounded inputs.
@@ -87,7 +88,22 @@ A100_LLAMA31_8B = dict(
     max_model_len=131072, prediction_max_tokens_per_request=131072,
     prediction_max_batch_size=256, max_tokens=131072,
 )
-PRESETS = {"a100_llama31_8b": A100_LLAMA31_8B}
+
+
+# H200 NVL + Nemotron-8B-UltraLong-1M (Llama-3.1-8B architecture, 1M context),
+# profiled into data/profiling/compute/h200/llama3.1-8b-1m and checked against
+# real vLLM 0.10.2 with prefix caching on: 901,520-token KV cache (56,345
+# blocks at --gpu-memory-utilization 0.9) and --max-model-len 890000, the
+# longest context that fits.
+H200_NEMOTRON_1M = dict(
+    name="h200_nemotron_1m",
+    model="llama3.1-8b-1m", device="h200", network_device="h200_dgx",
+    max_tokens_in_batch=2048, batch_size_cap=256, num_blocks=56345,
+    decode_cuda_graph_mode="piecewise", model_cpu_overhead=False,
+    max_model_len=890000, prediction_max_tokens_per_request=890000,
+    prediction_max_batch_size=256, max_tokens=890000,
+)
+PRESETS = {"a100_llama31_8b": A100_LLAMA31_8B, "h200_nemotron_1m": H200_NEMOTRON_1M}
 
 
 def simulation_args(

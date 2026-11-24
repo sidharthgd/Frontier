@@ -1,0 +1,129 @@
+# H200 + 1M-context version of frontier_concurrency_long.yaml: the
+# h200_nemotron_1m preset (56,345 KV blocks, 890k max_model_len) and TraceLab
+# converted at the 1M model's limit (tracelab_1m: compaction at 880k instead of
+# 120k), so agents keep their real context lengths. FreeInference has not been
+# re-converted yet (its raw trace is not on this machine), so only TraceLab is
+# evaluated. Load levels (session_concurrency) are placeholders until the FCFS
+# capacity check picks the H200 equivalents of c8 / c10.
+workloads:
+- name: synthetic_random
+  trace: synthetic:random
+  arrivals: sessions
+  num_requests: 200
+  num_blocks: 56345
+  weight: 1.0
+  gap_metric: false
+  simulation:
+    max_tokens: 890000
+    session_concurrency: 18
+    session_warmup: 600
+    max_think_time: 600
+    load_range: [0.8, 1.25]
+  backend: frontier
+  frontier: &frontier
+    # A100 + Llama-3.1-8B as validated against vLLM (frontier/rl/engine.py
+    # a100_llama31_8b): piecewise CUDA graphs,
+    # 128k context, no CPU-overhead tables. Runs before 2026-11-19
+    # (rl_runs/frontier_concurrency{,_ppo}) had decode CUDA graphs off.
+    preset: h200_nemotron_1m
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+eval_workloads:
+- name: tracelab_c8
+  trace: tracelab_1m
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 56345
+  gap_metric: false
+  simulation: &sim8
+    max_tokens: 890000
+    session_concurrency: 8
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier: *frontier
+- name: tracelab_c10
+  trace: tracelab_1m
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 56345
+  gap_metric: false
+  simulation: &sim10
+    max_tokens: 890000
+    session_concurrency: 10
+    session_warmup: 600
+    max_think_time: 600
+  backend: frontier
+  frontier: *frontier
+observation:
+  prefix_cache: true
+reward:
+  weights:
+    e2e_normalized: 1.0
+    ttft_hinge: 0.01
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  # one threshold per episode (FCFS's q95 TTFT)
+  reference_window_requests: 100000
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  init_middle_level_prob: 0.25
+imitation:
+  teacher: sjf_prefill_tokens_age200
+  iterations: 4
+  initial_seeds: 96
+  seeds_per_iteration: 64
+  beta_start: 0.5
+  beta_decay: 0.5
+  collect_decoding: argmax
+  epochs_per_iteration: 3
+  eval_every: 2
+  learning_rate: 0.0003
+  minibatch_size: 128
+  level_coef: 1.0
+  rank_coef: 1.0
+  max_dataset_size: 400000
+ppo:
+  imitation_coef: 0.1
+  learning_rate: 0.0001
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+num_priority_levels: 16
+iterations: 250
+seeds_per_iteration: 6
+group_size: 4
+num_workers: 24
+split_groups: true
+share_predictors: true
+reference_cache_dir: rl_runs/h200/references
+prefetch_workers: 3
+eval_every: 10
+eval_seeds: [1000000, 1000001, 1000002, 1000003, 1000004, 1000005, 1000006, 1000007, 1000008, 1000009, 1000010, 1000011, 1000012, 1000013, 1000014, 1000015, 1000016, 1000017]
+eval_decodings: [argmax]
+select_decoding: argmax
+keep_eval_checkpoints: true
+seed: 0
+output_dir: rl_runs/h200/smoke
+wandb: false
+wandb_project: vidur-rl

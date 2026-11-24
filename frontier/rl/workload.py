@@ -505,6 +505,8 @@ TRACE_FILES = {
 SESSION_TRACE_FILES = {
     "freeinference": "data/processed_traces/freeinference_2026-08-30_128k.csv",
     "tracelab": "data/processed_traces/tracelab_coding_128k.csv",
+    # contexts up to the H200 1M model's 890k max_model_len (compaction at 880k)
+    "tracelab_1m": "data/processed_traces/tracelab_coding_1m.csv",
     "sharegpt_multiturn": "data/processed_traces/sharegpt_multiturn_llama3_4k.csv",
 }
 
