@@ -36,3 +36,9 @@ Imitation+PPO is skipped (on the A100 it never left its teacher). ~8-10 h.
 - Results synced to the laptop (`rl_runs/h200/`) regularly; checkpoints too.
 - Keep Vast credit above ~$25 (about 15 h). A lapse restarts the box.
 - Runs resume from `latest.pt` (`--set resume_checkpoint=...`).
+
+## Corrections and changes (2026-11-24 ~07:00 UTC)
+- **Bug found and fixed:** the synthetic training sessions (`synthetic:random`) still compacted at 120k (the generator's own default), so the first three PPO runs trained on ~128k-capped sessions while evaluating on 1M contexts. Fixed in `frontier/trace_prep/sessions.py` (sessions compact 10k below max_tokens when max_tokens > 131072); synthetic prompts p90 91k -> 211k, p99 120k -> 322k. Those runs were stopped at iteration 19-20 and moved to `abandoned_synth128k/`. The capacity sweep's synthetic rows (`capacity/`) are from the old generator and are superseded by `capacity_synth1m/`. TraceLab results (capacity, heuristics, cpsjf) are unaffected.
+- **Moved boxes** to Vast #62308823 (`ssh -p 15047 root@79.161.30.134`): Threadripper PRO 7995WX, 192 threads, ~5.4 GHz, 258 GB limit, $1.46/hr. H200 timing models rebuilt there (box-to-box copy was blocked). Old box (#62261089) results pulled to the laptop; it can be destroyed.
+- **PPO settings now:** 2 runs (ppo_pure_e2e_w1 seed 0 and seed 1), 44 workers each (memory: 258 GB limit), 40 iterations, evals every 10 on 6 seeds (1000000-1000005), full 18-seed comparison afterwards. The squared-tail run (sq0.01) waits until these finish.
+- **Training concurrency:** picked from `capacity_synth1m/` (FCFS preemption closest to TraceLab c16's).
