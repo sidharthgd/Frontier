@@ -330,6 +330,10 @@ def sample_named_workload(
             return sample_concurrent_workload(sessions, num_requests, concurrency, seed, **concurrent_kwargs)
         return sample_session_workload(sessions, num_requests, qps, seed, **kwargs)
     params, load = synthetic.synthetic_params(trace, seed, load_range)
+    if max_tokens is not None and max_tokens > 131072:
+        # a long-context model (e.g. the 1M H200 setup): sessions compact 10k
+        # below its limit, as tracelab_1m does, not at the 128k default
+        params = dataclasses.replace(params, compact_at=max_tokens - 10_000)
     while concurrency:
         # random's load multiplier scales the number of agents
         sessions = sessions_from_frame(synthetic.generate_session_frame(params, seed), max_tokens)
