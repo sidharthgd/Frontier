@@ -37,6 +37,7 @@ def _init(config_path, output_dir):
         workloads={w.name: w for w in config.eval_workload_configs()},
         observation=config.observation_config(),
         levels=config.num_priority_levels,
+        model_config=config.model_config(),
         output_dir=output_dir,
         envs={},
         models={},
@@ -107,12 +108,27 @@ def _agent(name, seed):
         return _cache_protecting_sjf()
     if name.startswith("wmsjf"):
         return _watermark_sjf(float(name[len("wmsjf"):]))
+    # "<policy>@sample" decodes by sampling instead of argmax
+    decoding = "argmax"
+    if name.endswith("@sample"):
+        name, decoding = name[: -len("@sample")], "sample"
+    if name.startswith("init:"):
+        # the untrained policy a training run with this seed starts from
+        # (frontier/rl/train.py: torch.manual_seed(seed), then SchedulerModel)
+        import torch
+
+        from frontier.rl.model import SchedulerModel
+
+        if name not in _STATE["models"]:
+            torch.manual_seed(int(name[len("init:"):]))
+            _STATE["models"][name] = SchedulerModel(_STATE["model_config"])
+        return TorchAgent(_STATE["models"][name], seed, decoding)
     if not name.startswith("ckpt:"):
         return baseline_agent(name, seed=seed)
     path = name[len("ckpt:"):]
     if path not in _STATE["models"]:
         _STATE["models"][path] = load_checkpoint(path)["model_object"]
-    return TorchAgent(_STATE["models"][path], seed, "argmax")
+    return TorchAgent(_STATE["models"][path], seed, decoding)
 
 
 def _run(task):

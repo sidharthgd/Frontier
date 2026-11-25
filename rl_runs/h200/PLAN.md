@@ -40,5 +40,34 @@ Imitation+PPO is skipped (on the A100 it never left its teacher). ~8-10 h.
 ## Corrections and changes (2026-11-24 ~07:00 UTC)
 - **Bug found and fixed:** the synthetic training sessions (`synthetic:random`) still compacted at 120k (the generator's own default), so the first three PPO runs trained on ~128k-capped sessions while evaluating on 1M contexts. Fixed in `frontier/trace_prep/sessions.py` (sessions compact 10k below max_tokens when max_tokens > 131072); synthetic prompts p90 91k -> 211k, p99 120k -> 322k. Those runs were stopped at iteration 19-20 and moved to `abandoned_synth128k/`. The capacity sweep's synthetic rows (`capacity/`) are from the old generator and are superseded by `capacity_synth1m/`. TraceLab results (capacity, heuristics, cpsjf) are unaffected.
 - **Moved boxes** to Vast #62308823 (`ssh -p 15047 root@79.161.30.134`): Threadripper PRO 7995WX, 192 threads, ~5.4 GHz, 258 GB limit, $1.46/hr. H200 timing models rebuilt there (box-to-box copy was blocked). Old box (#62261089) results pulled to the laptop; it can be destroyed.
-- **PPO settings now:** 2 runs (ppo_pure_e2e_w1 seed 0 and seed 1), 44 workers each (memory: 258 GB limit), 100 iterations (user request; Cyrus ran up to 105-130), evals every 10 on 6 seeds (1000000-1000005), full 18-seed comparison afterwards. The squared-tail run (sq0.01) waits until these finish.
+- **PPO settings now:** 2 runs (ppo_pure_e2e_w1 seed 0 and seed 1), 44 workers each (memory: 258 GB limit), 40 iterations, evals every 10 on 6 seeds (1000000-1000005), full 18-seed comparison afterwards. The squared-tail run (sq0.01) waits until these finish.
 - **Training concurrency:** picked from `capacity_synth1m/` (FCFS preemption closest to TraceLab c16's).
+
+## 2026-11-24 07:30 UTC: PPO launched on the new box
+- Synthetic capacity check (1M compaction, 6 seeds, FCFS): calls preempted 14% / 23% / 18% / 25% at 12 / 18 / 24 / 30 agents (final, 6 seeds; mean e2e 62 / 105 / 135 / 172 s; age200 cuts mean e2e 16% / 24% / 32% / 30%). Pressure is set mostly by each seed's sampled session sizes (seeds range 0% to 50%), not by the agent count. Training uses 18 agents (commit e9e7ed65).
+- Launched 07:14 UTC: ppo_pure_e2e_w1 (seed 0) and ppo_pure_e2e_w1_seed1, 44 workers each, 100 iterations, eval every 10 on 6 seeds.
+- Iteration 1: rollout 476 s + update 23 s = 8.3 min. Memory ~200 GB of 258 GB, stable.
+- Estimate: ~13-14 h for 100 iterations (plus evals), so about iteration 50-55 by 15:00 UTC (10 AM EST), done ~22:00 UTC.
+
+## 2026-11-24 14:30 UTC: first positive eval (run 0, iteration 20)
+Eval seeds 1000000-05 (argmax), vs FCFS / age200 on the same seeds:
+| load | PPO mean e2e | FCFS | age200 | PPO p99 TTFT | FCFS | age200 |
+|---|---|---|---|---|---|---|
+| c12 | 20.6 | 20.9 | 20.2 | 19.8 | 20.0 | 18.0 |
+| c16 | 49.5 (-8.4%) | 54.0 | 47.4 | 76.7 | 60.5 | 86.5 |
+| c20 | 108.6 (-5.2%) | 114.6 | 91.1 | 215.7 | 98.1 | 231.1 |
+Iteration 10 had been -5% / -21% (c16 / c20) on return. Iterations average ~20-25 min (straggler episodes up to 2 h);
+run 1 is ~5 iterations behind run 0.
+
+## 2026-11-24 22:45 UTC: evals through iteration 40 (6 seeds, mean e2e / p99 TTFT, s)
+FCFS on the same seeds: c12 20.9 / 20.0, c16 54.0 / 60.5, c20 114.6 / 98.1.
+| run @iter | c12 | c16 | c20 |
+|---|---|---|---|
+| seed0 @10 | 20.5 / 18.6 | 57.7 / 72.8 | 138.2 / 143.9 |
+| seed0 @20 | 20.6 / 19.8 | 49.5 / 76.7 | 108.6 / 215.7 |
+| seed0 @30 | 20.8 / 16.8 | 51.0 / 69.5 | 123.8 / 154.1 |
+| seed0 @40 | 20.6 / 18.8 | 50.3 / 104.4 | 127.7 / 222.3 |
+| seed1 @10 | 22.2 / 17.2 | 68.1 / 89.8 | 152.1 / 163.9 |
+| seed1 @20 | 20.3 / 19.6 | 60.4 / 198.5 | 129.3 / 199.2 |
+| seed1 @30 | 21.1 / 18.5 | 65.6 / 106.7 | 160.7 / 215.5 |
+Seed 0 peaked at 20 (beat FCFS at c16/c20), then regressed at c20. Seed 1 never beat FCFS at c16/c20.
